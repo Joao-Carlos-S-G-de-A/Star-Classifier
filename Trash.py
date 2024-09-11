@@ -89,3 +89,17 @@ print(f'Test Accuracy: {accuracy:.4f}')
 
 # Save the model
 torch.save(model.state_dict(), "star_classifier_first.pth")
+
+
+from astroquery.vizier import Vizier
+
+v = Vizier(columns=['_RAJ2000', '_DEJ2000','B-V', 'Vmag', 'Plx'],
+           column_filters={"Vmag":">10"}, keywords=["optical", "xry"])  
+
+gaia_catalog_list = Vizier.find_catalogs('GAIA DR3') 
+print({k:v.description for k,v in gaia_catalog_list.items()})
+coordinates = SkyCoord(135.9, -65.3, unit=("deg", "deg"))
+
+result = Vizier(catalog='I/355/spectra').query_region(coordinates, radius="1d0m")
+
+#result = result.to_pandas()
