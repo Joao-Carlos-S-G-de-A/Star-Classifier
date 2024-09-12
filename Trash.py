@@ -103,3 +103,119 @@ coordinates = SkyCoord(135.9, -65.3, unit=("deg", "deg"))
 result = Vizier(catalog='I/355/spectra').query_region(coordinates, radius="1d0m")
 
 #result = result.to_pandas()
+
+
+simbad_data = pd.concat((filtered_result, filtered_result2))
+gaia_data = pd.concat((r, r2))
+print(simbad_data.shape)
+print(gaia_data.shape)
+
+# Convert Gaia source_id to string
+gaia_data['source_id'] = gaia_data['source_id'].astype(str)
+
+# Filter SIMBAD data to only include rows where 'ids' contains 'Gaia DR3'
+simbad_data['gaia_id'] = simbad_data['ids'].apply(lambda x: next((id for id in x.split('|') if id.startswith('Gaia DR3')), None))
+
+simbad_data['gaia_id'] = simbad_data['gaia_id'].str.lstrip('Gaia DR3')
+simbad_data = simbad_data.dropna(subset=['gaia_id'])
+
+# Convert Gaia ID to integer
+simbad_data['gaia_id'] = simbad_data['gaia_id'].astype(str)
+
+
+print(simbad_data['gaia_id'])
+# Merge Gaia and SIMBAD data on matching IDs
+merged_data = pd.merge(r, simbad_data, left_on='source_id', right_on='gaia_id', how='inner')
+
+# Display the merged data
+print(merged_data)
+
+def split_ids_into_chunks(id_string, chunk_size=1000):
+    # Split the string into a list of IDs
+    id_list = id_string.split(', ')
+    
+    # Create chunks of the specified size
+    chunks = [', '.join(id_list[i:i + chunk_size]) for i in range(0, len(id_list), chunk_size)]
+    
+    return chunks
+
+# Example usage
+GaiaDR3SourceIDs = ', '.join(simbad_data['gaia_id'].astype(str))
+chunks = split_ids_into_chunks(GaiaDR3SourceIDs)
+
+# Print the chunks to verify
+for i, chunk in enumerate(chunks):
+    print(f"Chunk {i+1}: {chunk}")
+
+
+    
+def GetGAIAData(GaiaDR3SourceIDs):
+    try:
+        dfGaia = pd.DataFrame()
+        qry = f"SELECT * FROM gaiadr3.gaia_source gs WHERE gs.source_id in ({GaiaDR3SourceIDs});"
+        job = Gaia.launch_job_async(qry)
+        tblGaia = job.get_results()
+        dfGaia = tblGaia.to_pandas()
+        print(dfGaia)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def split_ids_into_chunks(id_string, chunk_size=10000):
+    id_list = id_string.split(', ')
+    chunks = [', '.join(id_list[i:i + chunk_size]) for i in range(0, len(id_list), chunk_size)]
+    return chunks
+
+# Example usage
+GaiaDR3SourceIDs = ', '.join(simbad_data['gaia_id'].astype(str))
+chunks = split_ids_into_chunks(GaiaDR3SourceIDs)
+
+# Process each chunk
+for chunk in chunks:
+    GetGAIAData(chunk)
+def GetGAIAData(GaiaDR3SourceIDs):
+    # gets the GAIA data for the provided GaiaDR3SourceIDs's
+    # and writes to a local CSV
+        
+    dfGaia = pd.DataFrame()
+    
+    #job = Gaia.launch_job_async( "select top 100 * from gaiadr2.gaia_source where parallax>0 and parallax_over_error>3. ") # Select `good' parallaxes
+    qry = "SELECT * FROM gaiadr3.gaia_source gs WHERE gs.source_id in (" + GaiaDR3SourceIDs + ");"
+    
+    job = Gaia.launch_job_async( qry )
+    tblGaia = job.get_results()       #Astropy table
+    dfGaia = tblGaia.to_pandas()      #convert to Pandas dataframe
+    print(dfGaia)
+    
+    #npGAIARecords = dfGaia.to_numpy() #convert to numpy array    
+    #lstGAIARecords = [list(x) for x in npGAIARecords]   #convert to List[]
+    
+    #FileForLocalStorage = FolderForLocalStorage + str(lstGAIARecords[0][2]) + '.csv'  # use SourceID from 1st record
+    #dfGaia.to_csv (FileForLocalStorage, index = False, header=True)    
+GetGAIAData(simbad_data['gaia_id'])
+from astroquery.gaia import Gaia
+import pandas as pd
+
+def GetGAIAData(GaiaDR3SourceIDs):
+    try:
+        dfGaia = pd.DataFrame()
+        qry = f"SELECT * FROM gaiadr3.gaia_source gs WHERE gs.source_id in ({GaiaDR3SourceIDs});"
+        job = Gaia.launch_job_async(qry)
+        tblGaia = job.get_results()
+        dfGaia = tblGaia.to_pandas()
+        print(dfGaia)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+simbadgaiaid = simbad_data['gaia_id'].str.cat(sep=', ')
+GetGAIAData(simbad_data['gaia_id'].str.cat(sep=', '))
+
+Gaia.ROW_LIMIT = -1  # Ensure the default row limit.
+coord = SkyCoord(ra=0, dec=90, unit=(u.degree, u.degree), frame='icrs')
+j = Gaia.cone_search_async(coord, radius=u.Quantity(7.0, u.deg), columns=("source_id", "ra", "dec", "phot_g_mean_flux", "phot_g_mean_flux_error", "pm", "parallax", "parallax_error", "phot_bp_mean_flux", "phot_bp_mean_flux_error", "phot_rp_mean_flux", "phot_rp_mean_flux_error", "teff_gspphot", "teff_gspphot_lower", "teff_gspphot_upper", "logg_gspphot", "logg_gspphot_lower", "logg_gspphot_upper", "mh_gspphot", "mh_gspphot_upper", "mh_gspphot_lower", "bp_rp", "bp_g", "g_rp",    ))  
+r = j.get_results()
+r.pprint()  
+r = r.to_pandas()
+coord = SkyCoord(ra=0, dec=-90, unit=(u.degree, u.degree), frame='icrs')
+j = Gaia.cone_search_async(coord, radius=u.Quantity(7.0, u.deg), columns=("source_id", "ra", "dec", "phot_g_mean_flux", "phot_g_mean_flux_error", "pm", "parallax", "parallax_error", "phot_bp_mean_flux", "phot_bp_mean_flux_error", "phot_rp_mean_flux", "phot_rp_mean_flux_error", "teff_gspphot", "teff_gspphot_lower", "teff_gspphot_upper", "logg_gspphot", "logg_gspphot_lower", "logg_gspphot_upper", "mh_gspphot", "mh_gspphot_upper", "mh_gspphot_lower", "bp_rp", "bp_g", "g_rp",    ))  
+r2 = j.get_results()
+r2.pprint()  
+r2= r2.to_pandas()
