@@ -1,2 +1,4 @@
 *.npy
 *.pkl
+*.pth
+*.csv
