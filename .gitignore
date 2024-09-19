@@ -3,3 +3,6 @@
 *.pth
 *.csv
 *.fits
+gal_spectra/
+star_spectra/
+lamost_fits_files/
