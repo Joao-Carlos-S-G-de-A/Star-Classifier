@@ -5,4 +5,5 @@
 *.fits
 gal_spectra/
 star_spectra/
-lamost_fits_files/
+bin_spectra/
+agn_spectra/
