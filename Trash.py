@@ -219,3 +219,100 @@ j = Gaia.cone_search_async(coord, radius=u.Quantity(7.0, u.deg), columns=("sourc
 r2 = j.get_results()
 r2.pprint()  
 r2= r2.to_pandas()
+
+
+import os
+import numpy as np
+from astropy.io import fits
+from tqdm import tqdm  # Progress bar
+
+def load_spectra(file_list):
+    spectra_data = []
+    min_rows = np.inf  # Initialize as infinite to find the minimum number of rows
+
+    # First pass: determine the minimum number of rows across all spectra
+    print("Determining the minimum number of rows across spectra...")
+    for file_path in tqdm(file_list, desc="Calculating min rows", unit="file"):
+        with fits.open(file_path) as hdul:
+            # Access the primary HDU (index 0) and get the first row of data
+            spectra = hdul[0].data[0]  # First row of the primary HDU
+            min_rows = min(min_rows, len(spectra))
+
+    # Second pass: load and truncate the spectra to the minimum number of rows
+    print(f"Loading and truncating spectra to {min_rows} rows...")
+    for file_path in tqdm(file_list, desc="Loading spectra", unit="file"):
+        with fits.open(file_path) as hdul:
+            # Access the first row of the primary HDU and truncate
+            spectra = hdul[0].data[0][:min_rows]
+            spectra_data.append(spectra)
+
+    # Convert the list of spectra to a NumPy array for easier processing
+    return np.array(spectra_data)
+
+# Simulate the file list (replace with actual file paths)
+#file_list = ["path_to_spectra1.fits", "path_to_spectra2.fits"]  # Add all your actual file paths here
+
+# Load the truncated spectra with progress bars
+spectra_data = load_spectra(file_list)
+print(f"Spectra data shape: {spectra_data.shape}")  # (num_files, min_rows)
+
+
+
+def load_spectra(file_list):
+    spectra_data = []
+    min_rows = np.inf  # Initialize as infinite to find the minimum number of rows
+
+    # First pass: determine the minimum number of rows across all spectra
+    for file_path in file_list:
+        with fits.open(file_path) as hdul:
+            spectra = hdul[1].data[0]  # Assuming 'flux' column contains the spectra
+            min_rows = min(min_rows, len(spectra))
+
+    # Second pass: load and truncate the spectra to the minimum number of rows
+    for file_path in file_list:
+        with fits.open(file_path) as hdul:
+            spectra = hdul[1].data[0][:min_rows]  # Truncate to the min number of rows
+            spectra_data.append(spectra)
+    
+    # Convert the list of spectra to a NumPy array for easier processing
+    return np.array(spectra_data)
+
+# Load the truncated spectra
+spectra_data = load_spectra(file_list)
+print(f"Spectra data shape: {spectra_data.shape}")  # (num_files, min_rows)
+
+# Define the directories containing your spectra
+spectra_dirs = {
+    "gal_spectra": 0,  # Label 0 for galaxies
+    "star_spectra": 1,  # Label 1 for stars
+    "agn_spectra": 2,   # Label 2 for AGNs
+    "bin_spectra": 3    # Label 3 for binary stars
+}
+
+file_list = []
+labels = []
+
+# Iterate over the directories and assign labels based on the directory name
+for dir_name, label in spectra_dirs.items():
+    dir_path = os.path.join(os.getcwd(), dir_name)
+    for root, dirs, files in os.walk(dir_path):
+        for file in files:
+            #if file.endswith(".fits"):
+            file_path = os.path.join(root, file)
+            file_list.append(file_path)
+            labels.append(label)
+
+print(f"Total spectra files collected: {len(file_list)}")
+
+
+quantity_support()  # for getting units on the axes below  
+
+f = fits.open('gal_spectra/110033')  
+# The spectrum is in the second HDU of this file.
+specdata = f[0].data 
+specdata = specdata[0]  # The spectrum is in the first row of the data array.
+f.close() 
+
+# Load the crossmatched data
+gal_lamost_data = pd.read_pickle("gal_lamost_data.pkl")
+obsid_list = gal_lamost_data['obsid'].values
