@@ -8,3 +8,5 @@ star_spectra/
 bin_spectra/
 agn_spectra/
 convnet_model_*/
+OLD/
+Trash.py
