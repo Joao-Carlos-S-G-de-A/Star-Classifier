@@ -7,3 +7,4 @@ gal_spectra/
 star_spectra/
 bin_spectra/
 agn_spectra/
+convnet_model_*/
