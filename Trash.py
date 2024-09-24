@@ -316,3 +316,232 @@ f.close()
 # Load the crossmatched data
 gal_lamost_data = pd.read_pickle("gal_lamost_data.pkl")
 obsid_list = gal_lamost_data['obsid'].values
+
+
+
+# OLD  Custom Dataset for Spectra
+class SpectraDataset(Dataset):
+    def __init__(self, file_list, labels, transform=None):
+        self.file_list = file_list
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_path = self.file_list[idx]
+        # Assuming each file is a FITS file containing the spectra
+        with fits.open(file_path) as hdul:
+            spectra_data = hdul[1].data['flux']  # Assuming 'flux' is the field containing the spectra
+        
+        label = self.labels[idx]
+        
+        # Convert spectra to torch tensor
+        spectra_tensor = torch.tensor(spectra_data, dtype=torch.float32)
+        
+        if self.transform:
+            spectra_tensor = self.transform(spectra_tensor)
+        
+        return spectra_tensor, label
+
+# Assume file_list contains paths to your downloaded FITS files and labels contains the corresponding labels
+file_list = ["path_to_spectrum1.fits", "path_to_spectrum2.fits", ...]
+labels = [0, 1, 2, 3]  # Corresponding to stars, binary stars, non-active galaxies, AGNs
+
+
+# OLDimport torch.nn as nn
+import torch.nn.functional as F
+
+class SpectraCNN(nn.Module):
+    def __init__(self):
+        super(SpectraCNN, self).__init__()
+        
+        # Define the layers
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=16, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1)
+        
+        self.fc1 = nn.Linear(64 * 256, 128)  # Assuming input spectra length of 256
+        self.fc2 = nn.Linear(128, 4)  # 4 output classes
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.max_pool1d(x, kernel_size=2)
+        
+        x = F.relu(self.conv2(x))
+        x = F.max_pool1d(x, kernel_size=2)
+        
+        x = F.relu(self.conv3(x))
+        x = F.max_pool1d(x, kernel_size=2)
+        
+        x = x.view(x.size(0), -1)  # Flatten the tensor
+        
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        
+        return x
+
+import os
+import numpy as np
+import tensorflow as tf
+from tqdm import tqdm
+from astropy.io import fits
+
+def load_all_spectra(file_list):
+    """Load and normalize all spectra files."""
+    spectra_data = []
+    for file_path in tqdm(file_list, desc="Loading spectra", unit="file"):
+        try:
+            with fits.open(file_path) as hdul:
+                spectra = hdul[0].data[0]
+                normalized_spectra = normalize_spectra(spectra)
+                spectra_data.append(normalized_spectra)
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+    
+    return np.array(spectra_data)
+
+def normalize_spectra(spectra):
+    """Normalize spectra by dividing by the mean and applying the natural logarithm."""
+    mean_value = np.mean(spectra)
+    if mean_value == 0:
+        return spectra  # Avoid division by zero
+    normalized_spectra = np.log1p(spectra / mean_value)  # Use log1p for numerical stability (log(1 + x))
+    return normalized_spectra
+
+# Example usage:
+file_list, labels = generate_file_list()
+
+# Load spectra and create datasets from the loaded data
+spectra_data = load_all_spectra(file_list)  # Load all spectra into memory
+labels = np.array(labels)
+
+# Create TensorFlow datasets using the loaded data
+def create_tf_dataset(spectra_data, labels, batch_size=32):
+    dataset = tf.data.Dataset.from_tensor_slices((spectra_data, labels))
+    dataset = dataset.shuffle(buffer_size=len(spectra_data)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+train_files, train_labels, val_files, val_labels = split_dataset(file_list, labels)
+
+# Load the spectra for training and validation sets
+train_spectra = load_all_spectra(train_files)
+val_spectra = load_all_spectra(val_files)
+
+# Create TensorFlow datasets
+train_dataset = create_tf_dataset(train_spectra, np.array(train_labels))
+val_dataset = create_tf_dataset(val_spectra, np.array(val_labels))
+
+# Now use these datasets to train the model
+convnet_model = create_convnet(input_shape=(train_spectra.shape[1], 1), num_classes=len(set(labels)))
+history = train_convnet(convnet_model, train_dataset, val_dataset, epochs=20, batch_size=32)
+
+import os
+import numpy as np
+import tensorflow as tf
+from astropy.io import fits
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+
+def load_single_spectrum(file_path):
+    """Load and normalize a single spectrum from a FITS file."""
+    try:
+        with fits.open(file_path) as hdul:
+            spectra = hdul[0].data[0]
+            return normalize_spectra(spectra)
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None  # Return None if there's an error
+
+def load_all_spectra_parallel(file_list, max_workers=100):
+    """Load and normalize spectra in parallel using ThreadPoolExecutor."""
+    spectra_data = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Use ThreadPoolExecutor to parallelize the loading of FITS files
+        results = list(tqdm(executor.map(load_single_spectrum, file_list), 
+                            total=len(file_list), desc="Loading spectra"))
+
+    # Filter out None results (in case any files failed to load)
+    spectra_data = [spectrum for spectrum in results if spectrum is not None]
+
+    return np.array(spectra_data)
+
+def normalize_spectra(spectra):
+    """Normalize spectra by dividing by the mean and applying the natural logarithm."""
+    mean_value = np.mean(spectra)
+    if mean_value == 0:
+        return spectra  # Avoid division by zero
+    normalized_spectra = np.log1p(spectra / mean_value)  # Use log1p for numerical stability (log(1 + x))
+    return normalized_spectra
+
+# Example usage:
+file_list, labels = generate_file_list()
+
+# Load spectra data in parallel using multiple threads
+spectra_data = load_all_spectra_parallel(file_list, max_workers=100)
+
+# Convert labels to numpy array
+labels = np.array(labels)
+
+# Create TensorFlow datasets using the loaded data
+def create_tf_dataset(spectra_data, labels, batch_size=32):
+    dataset = tf.data.Dataset.from_tensor_slices((spectra_data, labels))
+    dataset = dataset.shuffle(buffer_size=len(spectra_data)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+# Split the dataset
+train_files, train_labels, val_files, val_labels = split_dataset(file_list, labels)
+
+# Load training and validation spectra in parallel
+train_spectra = load_all_spectra_parallel(train_files, max_workers=100)
+val_spectra = load_all_spectra_parallel(val_files, max_workers=100)
+
+# Create TensorFlow datasets
+train_dataset = create_tf_dataset(train_spectra, np.array(train_labels))
+val_dataset = create_tf_dataset(val_spectra, np.array(val_labels))
+
+# Now use these datasets to train the model
+convnet_model = create_convnet(input_shape=(train_spectra.shape[1], 1), num_classes=len(set(labels)))
+history = train_convnet(convnet_model, train_dataset, val_dataset, epochs=20, batch_size=32)
+
+# Function to train the model with the training and validation datasets
+def train_convnet(model, train_dataset, val_dataset, epochs=10, batch_size=32):
+    # Fit the model
+    history = model.fit(train_dataset,
+                        validation_data=val_dataset,
+                        epochs=epochs,
+                        batch_size=batch_size)
+    
+    return history
+
+    import tensorflow as tf
+
+
+# Function to train the model with the training and validation datasets
+def train_convnet(model, train_dataset, val_dataset, epochs=10, batch_size=32):
+    # Fit the model
+    history = model.fit(train_dataset,
+                        validation_data=val_dataset,
+                        epochs=epochs,
+                        batch_size=batch_size)
+    
+    return history
+
+# Determine input shape and number of classes from the dataset
+sample_spectra = load_spectra([train_files[0]])  # Load one sample to get input shape
+input_shape = (sample_spectra.shape[1], 1)  # Assuming 1D spectra, with shape (length, channels)
+num_classes = len(set(labels))  # Assuming 'labels' are numerical categories
+
+# Create a CNN model with custom parameters
+convnet_model = create_convnet(input_shape=input_shape, num_classes=num_classes, 
+                               num_filters=[32, 64], 
+                               kernel_size=(3,), 
+                               dense_units=128, 
+                               dropout_rate=0.5)
+
+# Train the model using the training and validation datasets
+history = train_convnet(convnet_model, train_dataset, val_dataset, epochs=20, batch_size=32)
+
+# You can now access metrics such as accuracy, loss, and validation loss from the `history` object.
