@@ -743,3 +743,98 @@ def plot_sample_spectra(file_list, num_samples=5):
     plt.show()
 plot_spectra(train_files)
 
+import tensorflow as tf
+import os
+import numpy as np
+
+from tqdm import tqdm
+from astropy.io import fits
+
+def generate_file_list():
+    spectra_dirs = {
+        "gal_spectra": 0,  # Label 0 for galaxies
+        "star_spectra": 1,  # Label 1 for stars
+        "agn_spectra": 2,   # Label 2 for AGNs
+        "bin_spectra": 3    # Label 3 for binary stars
+    }
+
+    file_list = []
+    labels = []
+
+    print("Gathering FITS files...")
+    for dir_name, label in spectra_dirs.items():
+        dir_path = os.path.join(os.getcwd(), dir_name)
+        for root, dirs, files in os.walk(dir_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                file_list.append(file_path)
+                labels.append(label)
+
+    print(f"Total spectra files collected: {len(file_list)}")
+    return file_list, labels
+
+def load_spectra(file_list, known_rows=None):
+    spectra_data = []
+    if known_rows is None:
+        known_rows = np.inf
+        for file_path in tqdm(file_list, desc="Finding min rows", unit="file"):
+            try:
+                with fits.open(file_path) as hdul:
+                    spectra = hdul[0].data[0]
+                    known_rows = min(known_rows, len(spectra))
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+
+    print(f"\nLoading spectra (truncated to {known_rows} rows)...")
+    for file_path in tqdm(file_list, desc="Loading spectra", unit="file"):
+        try:
+            with fits.open(file_path) as hdul:
+                spectra = hdul[0].data[0][:known_rows]
+                spectra_data.append(spectra)
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+
+    spectra_data = np.array(spectra_data)
+    return spectra_data
+
+def create_dataset(file_list, labels, batch_size=32):
+    dataset = tf.data.Dataset.from_tensor_slices((file_list, labels))
+
+    # Load and parse the FITS files
+    def load_and_parse(file_path, label):
+        # Load spectra from FITS file
+        spectra = tf.py_function(load_spectra, [file_path], tf.float32)
+        return spectra, label
+
+    # Apply the loading function to the dataset
+    dataset = dataset.map(load_and_parse, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Shuffle and batch the data
+    dataset = dataset.shuffle(buffer_size=len(file_list)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return dataset
+
+def split_dataset(file_list, labels, val_split=0.2):
+    total_size = len(file_list)
+    val_size = int(val_split * total_size)
+    
+    # Shuffle the data before splitting
+    indices = np.random.permutation(total_size)
+    train_indices, val_indices = indices[val_size:], indices[:val_size]
+    
+    train_files = [file_list[i] for i in train_indices]
+    train_labels = [labels[i] for i in train_indices]
+    val_files = [file_list[i] for i in val_indices]
+    val_labels = [labels[i] for i in val_indices]
+    
+    return train_files, train_labels, val_files, val_labels
+
+# Example usage
+file_list, labels = generate_file_list()
+
+# Split the dataset
+train_files, train_labels, val_files, val_labels = split_dataset(file_list, labels)
+
+# Create TensorFlow datasets
+train_dataset = create_dataset(train_files, train_labels)
+val_dataset = create_dataset(val_files, val_labels)
