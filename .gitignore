@@ -3,6 +3,7 @@
 *.pth
 *.csv
 *.fits
+*.keras
 gal_spectra/
 star_spectra/
 bin_spectra/
