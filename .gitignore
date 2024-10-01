@@ -11,3 +11,5 @@ agn_spectra/
 convnet_model_*/
 OLD/
 Trash.py
+training_h5/
+validation_h5/
