@@ -838,3 +838,220 @@ train_files, train_labels, val_files, val_labels = split_dataset(file_list, labe
 # Create TensorFlow datasets
 train_dataset = create_dataset(train_files, train_labels)
 val_dataset = create_dataset(val_files, val_labels)
+
+
+# Function to train the model with the training and validation datasets
+def train_convnet(model, limit_per_label=2000, epochs=1, batch_size=32, patience=5):
+    # Define early stopping callback
+    early_stopping = EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)
+    
+    # Use the updated function that loads datasets from pre-separated directories
+    train_dataset, val_dataset = generate_datasets_from_preseparated(limit_per_dir=limit_per_label)[0:2]
+    
+    # Fit the model
+    history = model.fit(train_dataset,
+                        validation_data=val_dataset,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        callbacks=[early_stopping])
+    
+    return history
+
+
+def train_convnet_many_times(model, epochs_per_run=1, batch_size=32, num_runs=10, limit_per_label=2000):
+    histories = []
+    for i in range(num_runs):
+        print(f"Training run {i+1}/{num_runs}...")
+        # Use the updated train_convnet function
+        history = train_convnet(model, limit_per_label=limit_per_label, epochs=epochs_per_run, batch_size=batch_size)
+        histories.append(history)
+    
+    return histories
+
+
+def load_single_spectrum(file_path, target_length=3748):
+    """Load and normalize a single spectrum from a FITS file, truncating or padding to target_length."""
+    try:
+        with fits.open(file_path) as hdul:
+            spectra = hdul[0].data[0]
+            spectra = normalize_spectra(spectra)
+            
+            # Truncate or pad spectra to ensure uniform length
+            if len(spectra) > target_length:
+                spectra = spectra[:target_length]  # Truncate
+            else:
+                spectra = np.pad(spectra, (0, max(0, target_length - len(spectra))), mode='constant')  # Pad with zeros
+            
+            return spectra
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None  # Return None if there's an error
+
+
+def load_all_spectra_parallel(file_list, target_length=3748, max_workers_=512):
+    """Load and normalize spectra in parallel using ThreadPoolExecutor."""
+    spectra_data = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers_) as executor:
+        # Use ThreadPoolExecutor to parallelize the loading of FITS files
+        results = list(tqdm(executor.map(lambda f: load_single_spectrum(f, target_length), file_list), 
+                            total=len(file_list), desc="Loading spectra"))
+
+    # Filter out None results (in case any files failed to load)
+    spectra_data = [spectrum for spectrum in results if spectrum is not None]
+
+    return np.array(spectra_data)
+
+len_ = 3748 # Length of the spectra data
+
+
+def generate_file_list(limit_per_dir = 10000):
+    spectra_dirs = {
+        "gal_spectra": 0,  # Label 0 for galaxies
+        "star_spectra": 1,  # Label 1 for stars
+        "agn_spectra": 2,   # Label 2 for AGNs
+        "bin_spectra": 3    # Label 3 for binary stars
+    }
+
+    file_list = []
+    labels = []
+
+    print("Gathering FITS files...")
+    for dir_name, label in spectra_dirs.items():
+        dir_path = os.path.join(os.getcwd(), dir_name)
+        dir_files = []
+
+        # Collect all files in the directory
+        for root, dirs, files in os.walk(dir_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                dir_files.append(file_path)
+        
+        # Randomly select files up to the limit
+        if len(dir_files) > limit_per_dir:
+            selected_files = random.sample(dir_files, limit_per_dir)
+        else:
+            selected_files = dir_files
+        
+        # Append selected files and their labels
+        file_list.extend(selected_files)
+        labels.extend([label] * len(selected_files))
+
+    print(f"Total spectra files collected: {len(file_list)}")
+    return file_list, labels
+
+
+def load_spectra(file_list, known_rows=None):
+    spectra_data = []
+    if known_rows is None:
+        known_rows = np.inf
+        for file_path in tqdm(file_list, desc="Finding min rows", unit="file"):
+            try:
+                with fits.open(file_path) as hdul:
+                    spectra = hdul[0].data[0]
+                    known_rows = min(known_rows, len(spectra))
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+
+    print(f"\nLoading spectra (truncated to {known_rows} rows)...")
+    for file_path in tqdm(file_list, desc="Loading spectra", unit="file"):
+        try:
+            with fits.open(file_path) as hdul:
+                spectra = hdul[0].data[0][:known_rows]
+                normalized_spectra = normalize_spectra(spectra)
+                spectra_data.append(normalized_spectra)
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+
+    spectra_data = np.array(spectra_data)
+    return spectra_data
+
+
+def create_dataset(file_list, labels, batch_size=32):
+    dataset = tf.data.Dataset.from_tensor_slices((file_list, labels))
+
+    def load_and_parse(file_path, label):
+        spectra = tf.py_function(load_spectra, [file_path], tf.float32)
+        return spectra, label
+
+    dataset = dataset.map(load_and_parse, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.shuffle(buffer_size=len(file_list)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return dataset
+
+
+def split_dataset(file_list, labels, val_split=0.2):
+    total_size = len(file_list)
+    val_size = int(val_split * total_size)
+    
+    indices = np.random.permutation(total_size)
+    train_indices, val_indices = indices[val_size:], indices[:val_size]
+    
+    train_files = [file_list[i] for i in train_indices]
+    print(train_files)
+    train_labels = [labels[i] for i in train_indices]
+    val_files = [file_list[i] for i in val_indices]
+    val_labels = [labels[i] for i in val_indices]
+    
+    return train_files, train_labels, val_files, val_labels
+
+
+def normalize_spectra(spectra):
+    """Normalize spectra by dividing by the mean and applying the natural logarithm."""
+    mean_value = np.mean(spectra)
+    std_value = np.std(spectra)
+    min_value = np.min(spectra)
+    if std_value == 0:
+        print("Warning: Standard deviation is zero, cannot normalize spectra.")
+        return spectra  # Avoid division by zero
+    normalized_spectra = ((spectra - min_value  + 0.01) / (mean_value - min_value + 0.01)) - 1 # min_value is added to avoid negative values
+    return normalized_spectra
+
+
+def load_single_spectrum(file_path, target_lenth=3748):
+    """Load and normalize a single spectrum from a FITS file, truncating or padding to target_length."""
+    try:
+        with fits.open(file_path) as hdul:
+            spectra = hdul[0].data[0]
+            spectra = normalize_spectra(spectra)
+            
+            # Truncate or pad spectra to ensure uniform length
+            if len(spectra) > target_length:
+                spectra = spectra[:target_length]  # Truncate
+            else:
+                spectra = np.pad(spectra, (0, max(0, target_length - len(spectra))), mode='constant')  # Pad with zeros
+            
+            return spectra
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None  # Return None if there's an error
+
+
+def load_all_spectra_parallel(file_list, target_length=3748, max_workers_=512):
+    """Load and normalize spectra in parallel using ThreadPoolExecutor."""
+    spectra_data = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers_) as executor:
+        # Use ThreadPoolExecutor to parallelize the loading of FITS files
+        results = list(tqdm(executor.map(lambda f: load_single_spectrum(f, target_length), file_list), 
+                            total=len(file_list), desc="Loading spectra"))
+
+    # Filter out None results (in case any files failed to load)
+    spectra_data = [spectrum for spectrum in results if spectrum is not None]
+
+    return np.array(spectra_data)
+
+
+def generate_random_dataset(lim_per_label = 2000):
+    # Example usage:
+    file_list, labels = generate_file_list(limit_per_dir=lim_per_label)
+    # Convert labels to numpy array
+    labels = np.array(labels)
+    # Continue with creating train/validation datasets
+    train_files, train_labels, val_files, val_labels = split_dataset(file_list, labels)
+    # Load training and validation spectra in parallel
+    train_spectra = load_all_spectra_parallel(train_files, target_length=len_)
+    val_spectra = load_all_spectra_parallel(val_files, target_length=len_)
+    # Create TensorFlow datasets
+    train_dataset, val_dataset = removenan(train_spectra, train_labels, val_spectra, val_labels)
+    return train_dataset, val_dataset
