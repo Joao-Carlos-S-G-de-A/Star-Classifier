@@ -1055,3 +1055,770 @@ def generate_random_dataset(lim_per_label = 2000):
     # Create TensorFlow datasets
     train_dataset, val_dataset = removenan(train_spectra, train_labels, val_spectra, val_labels)
     return train_dataset, val_dataset
+
+# Specify the directory
+directory = 'gaia_training_set/gal_data'
+
+# Create the directory if it doesn't exist
+if not os.path.exists(directory):
+    os.makedirs(directory)
+
+# Loop through the DataFrame and save each row as a .npy file
+for index, row in matched_data.iterrows():
+    # Extract the filename
+    filename = row['obsid']
+    
+    # Select the columns you want to save
+    values_to_save = row[['ra','ra_error', 'dec', 'dec_error', 'phot_g_mean_flux', 'phot_g_mean_flux_error', 'phot_bp_mean_flux', 'phot_bp_mean_flux_error', 'phot_rp_mean_flux', 'phot_rp_mean_flux_error', 'parallax', 'parallax_error', 'pmra', 'pmra_error', 'pmdec', 'pmdec_error']].values
+    
+    # Save the values as a .npy file in the specified directory
+    np.save(os.path.join(directory, f"{filename}.npy"), values_to_save)
+
+    
+        # Step 3: Create a new frequency space (1000 parameters) for interpolation
+        new_frequencies = np.linspace(frequencies.min(), frequencies.max(), 1000)
+
+        # Step 4: Interpolate the FFT magnitudes into the new frequency space
+        interpolator = interp1d(frequencies, fft_magnitude, kind='linear', fill_value="extrapolate")
+        interpolated_fft_magnitude = interpolator(new_frequencies)
+
+        # Step 5: Store the interpolated data along with labels and other metadata
+        # Create a dictionary for the interpolated spectrum
+        interpolated_data = {f'fft_mag_{i}': value for i, value in enumerate(interpolated_fft_magnitude)}
+
+        # Add the original metadata back (e.g., file_name, label, row)
+        interpolated_data['file_name'] = row['file_name']
+        interpolated_data['label'] = row['label']
+        interpolated_data['row'] = row['row']
+
+        # Append the interpolated data to the results list
+        results_list.append(interpolated_data)
+    
+    import numpy as np
+import pandas as pd
+from scipy.fft import fft
+from scipy.interpolate import interp1d
+
+# Load the data from the pickle file
+df = pd.read_pickle('Pickles/lmst/flux_bin_df.pkl')  # Load the flux data
+df_freq = pd.read_pickle('Pickles/lmst/freq_bin_df.pkl')  # Load the corresponding original frequency data
+
+# Set directory to save the interpolated data
+output_dir = 'Pickles/lmst/interpolated_data/train_bin.pkl'
+
+# Initialize an empty list to store the results before concatenating into a DataFrame
+results_list = []
+
+# Loop through each row in the DataFrame (each row is a spectrum)
+for index, row in df.iterrows():
+    # Extract the fluxes (assuming they start at column 0 and continue to the last column)
+    fluxes = row[:-3].values  # Exclude the last columns (file_name, label, row)
+    print(index)
+    # Extract the frequencies (if they are constant, you can define it once outside the loop)
+    frequencies = df_freq.iloc[int(index/3), :-3].values  # Exclude the last columns (file_name, label, row)
+    #frequencies = np.linspace(frequencies[0], frequencies[-1], len(fluxes))  # Assuming linearly spaced frequencies
+    # Step 1: Perform DFT on the flux data
+    flux_fft = fft(fluxes)
+
+    # Step 2: Get the magnitude of the FFT (absolute values)
+    fft_magnitude = np.abs(flux_fft)
+    
+    # Step 3: Create a new frequency space (1000 parameters) for interpolation
+    new_frequencies = np.linspace(frequencies.min(), frequencies.max(), 1000)
+    
+    # Step 4: Interpolate the FFT magnitudes into the new frequency space
+    interpolator = interp1d(frequencies, fft_magnitude, kind='linear', fill_value="extrapolate")
+    interpolated_fft_magnitude = interpolator(new_frequencies)
+    
+    # Step 5: Store the interpolated data along with labels and other metadata
+    # Create a dictionary for the interpolated spectrum
+    interpolated_data = {f'fft_mag_{i}': value for i, value in enumerate(interpolated_fft_magnitude)}
+    
+    # Add the original metadata back (e.g., file_name, label, row)
+    interpolated_data['file_name'] = row['file_name']
+    interpolated_data['label'] = row['label']
+    interpolated_data['row'] = row['row']
+    
+    # Append the interpolated data to the results list
+    results_list.append(interpolated_data)
+
+# Step 6: Convert the list of results into a DataFrame
+interpolated_spectra_df = pd.DataFrame(results_list)
+
+# Save the resulting DataFrame to a new pickle file
+interpolated_spectra_df.to_pickle(output_dir)
+
+# Optionally, save to CSV or other formats
+# interpolated_spectra_df.to_csv('interpolated_spectra_data.csv', index=False)
+import numpy as np
+import pandas as pd
+from scipy.fft import fft
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+
+def interpolate_spectrum(fluxes_loc, frequencies_loc, output_dir):
+    """Interpolates the flux values to fill in missing data points."""
+    # Load the data from the pickle file
+    df_flux = pd.read_pickle(fluxes_loc).reset_index(drop=True)  # Reset index for zero-based iteration
+    df_freq = pd.read_pickle(frequencies_loc).reset_index(drop=True)  # Same for df_freq
+
+
+    # Initialize an empty list to store the results before concatenating into a DataFrame
+    results_list = []
+
+
+    # Loop through each row in the DataFrame (each row is a spectrum) with tqdm for progress bar
+    for index, row in tqdm(df_flux.iterrows(), total=len(df_flux), desc='Interpolating spectra'):
+        # Extract the fluxes (assuming they start at column 0 and continue to the last column)
+        fluxes = row[:-3].values  # Exclude the last columns (file_name, label, row)
+
+
+        # Extract the frequencies (if they are constant, you can define it once outside the loop)
+        frequencies = df_freq.iloc[int(index/3), :-3].values  # Exclude the last columns (file_name, label, row)
+
+        # Count the number of NaN and 0 values in the fluxes and frequencies
+        fluxes = pd.to_numeric(row[:-3], errors='coerce').values  # Exclude and convert to numeric
+        frequencies = pd.to_numeric(df_freq.iloc[index, :-3], errors='coerce').values  # Same for frequencies
+        num_nan = np.isnan(fluxes).sum() + np.isnan(frequencies).sum() # Count NaN values
+        num_zero = (fluxes == 0).sum() + (frequencies == 0).sum()  # Count zero values
+
+        # Initialize lists to store problematic file_names
+        nan_files = []
+
+        # Special handling for NaN values, counting nans in sequence
+        if num_nan > 10:
+            num_nan_seq = 0
+            for i in range(len(fluxes)):
+                if np.isnan(fluxes[i]) or np.isnan(frequencies[i]):
+                    num_nan_seq += 1
+                else:
+                    num_nan_seq = 0
+                if num_nan_seq > 10:
+                    print(f"File {row['file_name']} has more than 10 NaN values in sequence.")
+                    nan_files.append(row['file_name'])
+                    break
+            continue
+        if num_zero > 10:
+            num_zero_seq = 0
+            for i in range(len(fluxes)):
+                if fluxes[i] == 0 or frequencies[i] == 0:
+                    num_zero_seq += 1
+                else:
+                    num_zero_seq = 0
+                if num_zero_seq > 10:
+                    print(f"File {row['file_name']} has more than 10 zero values in sequence.")
+                    nan_files.append(row['file_name'])
+                    break
+            continue
+
+        # Deal with NaN values
+        fluxes = fluxes[~np.isnan(fluxes)]
+        frequencies = frequencies[~np.isnan(fluxes)]
+
+        # Interpolate to fill in missing values
+        f = interp1d(frequencies, fluxes, kind='linear', fill_value="extrapolate")
+        new_frequencies = np.linspace(frequencies.min(), frequencies.max(), len(row[:-3].values))
+
+        # Interpolated flux values
+        interpolated_fluxes = f(new_frequencies)
+
+        # Store the interpolated data along with labels and other metadata
+        # Create a dictionary for the interpolated spectrum
+        interpolated_data = {f'flux_{i}': value for i, value in enumerate(interpolated_fluxes)}
+
+        # Add the original metadata back (e.g., file_name, label, row)
+        interpolated_data['file_name'] = row['file_name']
+        interpolated_data['label'] = row['label']
+        #interpolated_data['row'] = row['row']
+
+        # Append the interpolated data to the results list
+        results_list.append(interpolated_data)
+
+        if int(index/3) % 100 == 0:  # Save every 100 rows
+            pd.DataFrame(results_list).to_pickle(output_dir, mode='a')  # Save in append mode
+            results_list = []  # Clear list to free memory
+
+
+    # Convert the list of results into a DataFrame
+    #interpolated_spectra_df = pd.DataFrame(results_list)
+
+    # Save the resulting DataFrame to a new pickle file
+    #interpolated_spectra_df.to_pickle(output_dir)
+
+    # Return the list of files with NaN values
+    return nan_files
+
+
+
+
+import os
+
+def interpolate_spectrum(fluxes_loc, frequencies_loc, output_dir, limit=10):
+    """Interpolates the flux values to fill in missing data points."""
+    # Load the data from the pickle file
+    df_flux = pd.read_pickle(fluxes_loc).reset_index(drop=True)  # Reset index for zero-based iteration
+    df_freq = pd.read_pickle(frequencies_loc).reset_index(drop=True)  # Same for df_freq
+
+    # Initialize an empty list to store the results before concatenating into a DataFrame
+    results_list = []
+
+    # Initialize lists to store problematic file_names
+    nan_files = []
+
+    # Overwrite the output file at the beginning
+    if os.path.exists(output_dir):
+        os.remove(output_dir)
+
+    # Loop through each row in the DataFrame (each row is a spectrum) with tqdm for progress bar
+    for index, row in tqdm(df_flux.iterrows(), total=len(df_flux), desc='Interpolating spectra'):
+
+    # Extract the fluxes (assuming they start at column 0 and continue to the last column)
+        fluxes = row[:-3].values  # Exclude the last columns (file_name, label, row)
+
+
+        # Extract the frequencies (if they are constant, you can define it once outside the loop)
+        frequencies = df_freq.iloc[int(index/3), :-3].values  # Exclude the last columns (file_name, label, row)
+
+        # Count the number of NaN and 0 values in the fluxes and frequencies
+        fluxes = pd.to_numeric(row[:-3], errors='coerce').values  # Exclude and convert to numeric
+        frequencies = pd.to_numeric(df_freq.iloc[index, :-3], errors='coerce').values  # Same for frequencies
+        num_nan = np.isnan(fluxes).sum() + np.isnan(frequencies).sum() # Count NaN values
+        num_zero = (fluxes == 0).sum() + (frequencies == 0).sum()  # Count zero values
+
+
+
+        # Special handling for NaN values, counting nans in sequence, except for the first 10
+        if num_nan > limit and index > limit*3 and index < len(df_flux*3)-limit*3:
+            num_nan_seq = 0
+            for i in range(len(fluxes)):
+                if np.isnan(fluxes[i]) or np.isnan(frequencies[i]):
+                    num_nan_seq += 1
+                else:
+                    num_nan_seq = 0
+                if num_nan_seq > limit:
+                    nan_files.append(row['file_name'])
+                    break
+            continue
+        if num_zero > limit and index > limit*3 and index < len(df_flux*3)-limit*3:
+            num_zero_seq = 0
+            for i in range(len(fluxes)):
+                if fluxes[i] == 0 or frequencies[i] == 0:
+                    num_zero_seq += 1
+                else:
+                    num_zero_seq = 0
+                if num_zero_seq > limit:
+                    nan_files.append(row['file_name'])
+                    break
+            continue
+
+        # Deal with NaN values
+        fluxes = fluxes[~np.isnan(fluxes)]
+        frequencies = frequencies[~np.isnan(fluxes)]
+
+        # Interpolate to fill in missing values
+        f = interp1d(frequencies, fluxes, kind='linear', fill_value="extrapolate")
+        new_frequencies = np.linspace(frequencies.min(), frequencies.max(), len(row[:-3].values))
+
+        # Interpolated flux values
+        interpolated_fluxes = f(new_frequencies)
+
+        # Store the interpolated data along with labels and other metadata
+        # Create a dictionary for the interpolated spectrum
+        interpolated_data = {f'flux_{i}': value for i, value in enumerate(interpolated_fluxes)}
+
+        # Add the original metadata back (e.g., file_name, label, row)
+        interpolated_data['file_name'] = row['file_name']
+        interpolated_data['label'] = row['label']
+        
+        # Append the interpolated data to the results list
+        results_list.append(interpolated_data)
+
+        if int(index / 3) % 100 == 0:  # Save every 1000 rows
+            # Check if the output file already exists
+            if os.path.exists(output_dir):
+                existing_df = pd.read_pickle(output_dir)  # Load existing data
+                new_df = pd.DataFrame(results_list)
+                # Concatenate existing and new data
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                combined_df.to_pickle(output_dir)  # Save combined DataFrame
+            else:
+                # If the file doesn't exist, create a new DataFrame and save
+                pd.DataFrame(results_list).to_pickle(output_dir)
+
+            #results_list = []  # Clear list to free memory
+    print(f"Initial number of rows: {len(df_flux)}")
+    print(f"Number of rows after removing NaN/zero values: {len(results_list)}")
+
+    # After the loop, save any remaining results
+    if results_list:
+        if os.path.exists(output_dir):
+            existing_df = pd.read_pickle(output_dir)
+            new_df = pd.DataFrame(results_list)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            combined_df.to_pickle(output_dir)
+        else:
+            pd.DataFrame(results_list).to_pickle(output_dir)
+    print(f"Number of rows after removing NaN/zero values: {len(results_list)}")
+    print(f"Interpolation complete. Number of NaN files: {len(nan_files)}")
+
+    return nan_files
+import os
+import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+import gc
+
+def interpolate_spectrum(fluxes_loc, frequencies_loc, output_dir, limit=10, edge_limit=20, chunk_size=1000):
+    """Interpolates the flux values to fill in missing data points."""
+    # Load the entire data
+    df_freq = pd.read_pickle(frequencies_loc).reset_index(drop=True).drop(columns=['row'])
+    df_flux = pd.read_pickle(fluxes_loc).reset_index(drop=True).drop(columns=['row'])
+
+    # Initialize lists to store problematic file_names
+    nan_files = []  
+    cnt_success = 0
+
+    # Overwrite the output file at the beginning
+    if os.path.exists(output_dir):
+        os.remove(output_dir)
+
+    # Split the DataFrame into chunks
+    num_chunks = len(df_flux) // chunk_size + 1
+
+    for chunk_idx in range(num_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min((chunk_idx + 1) * chunk_size, len(df_flux))
+
+        df_flux_chunk = df_flux.iloc[start_idx:end_idx]
+        df_freq_chunk = df_freq.iloc[start_idx:end_idx]
+
+        results_list = []
+
+        for relative_index, row in tqdm(df_flux_chunk.iterrows(), total=len(df_flux_chunk), desc=f'Interpolating spectra (chunk {chunk_idx + 1}/{num_chunks})'):
+            try:
+                # Use absolute index for accessing corresponding frequency row
+                abs_index = start_idx + relative_index
+
+                # Fetch the corresponding frequency row based on the absolute index
+                fluxes = row[:-2].values
+                frequencies = df_freq_chunk.iloc[relative_index, :-2].values
+
+                # Convert to numeric and handle NaNs
+                fluxes = pd.to_numeric(row[:-2], errors='coerce').values
+                frequencies = pd.to_numeric(df_freq_chunk.iloc[relative_index, :-2], errors='coerce').values
+
+                num_nan = np.isnan(fluxes).sum() + np.isnan(frequencies).sum()
+                num_zero = (fluxes == 0).sum() + (frequencies == 0).sum()
+
+                if num_nan > limit or num_zero > limit:
+                    nan_files.append(row['file_name'])
+                    continue
+
+                # Filter NaNs
+                fluxes = fluxes[~np.isnan(fluxes)]
+                frequencies = frequencies[~np.isnan(fluxes)]
+
+                # Interpolation
+                f = interp1d(frequencies, fluxes, kind='linear', fill_value="extrapolate")
+                new_frequencies = np.linspace(frequencies.min(), frequencies.max(), len(row[:-2].values))
+                interpolated_fluxes = f(new_frequencies)
+
+                interpolated_data = {f'flux_{i}': value for i, value in enumerate(interpolated_fluxes)}
+                interpolated_data['file_name'] = row['file_name']
+                interpolated_data['label'] = row['label']
+                results_list.append(interpolated_data)
+
+            except Exception as e:
+                print(f"Error processing row {abs_index}: {e}")
+                continue
+
+        if os.path.exists(output_dir):
+            existing_df = pd.read_pickle(output_dir)
+            new_df = pd.DataFrame(results_list)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            combined_df.to_pickle(output_dir)
+        else:
+            pd.DataFrame(results_list).to_pickle(output_dir)
+
+        cnt_success += len(results_list)
+        results_list = []
+        gc.collect()  # Explicitly call garbage collection
+
+    print(f"Total successful interpolations: {cnt_success}")
+    print(f"Total skipped due to NaNs or zeros: {len(nan_files)}")
+
+    return nan_files
+
+flux_loc = 'Pickles/lmst/flux_star_df.pkl'
+freq_loc = 'Pickles/lmst/freq_star_df.pkl'
+output_dir = 'Pickles/lmst/interpolated_data/train_star.pkl'
+
+tstarnan = interpolate_spectrum(flux_loc, freq_loc, output_dir, limit=10)
+import os
+import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+
+def interpolate_spectrum_in_chunks(fluxes_loc, frequencies_loc, output_dir, chunk_size=5000, limit=10, edge_limit=20):
+    """Interpolates the flux values to fill in missing data points, processing the CSV file in chunks."""
+    # Initialize lists to store problematic file_names
+    nan_files = []  
+
+    # Overwrite the output file at the beginning
+    if os.path.exists(output_dir):
+        os.remove(output_dir)
+
+    # Open the CSV files in chunks
+    flux_chunks = pd.read_csv(fluxes_loc, chunksize=chunk_size)
+    freq_chunks = pd.read_csv(frequencies_loc, chunksize=chunk_size)
+
+    # Loop through the chunks simultaneously
+    for flux_chunk, freq_chunk in zip(tqdm(flux_chunks, desc="Processing chunks"), freq_chunks):
+        # Ensure both chunks have the same number of rows
+        if len(flux_chunk) != len(freq_chunk):
+            raise ValueError("Flux and frequency chunks have different sizes!")
+
+        # Initialize an empty list to store the results for the current chunk
+        results_list = []
+
+        # Loop through each row in the chunk (each row is a spectrum)
+        for idx, row in flux_chunk.iterrows():
+            # Extract the fluxes (assuming they start at column 0 and continue to the last column)
+            fluxes = row[:-2].values  # Exclude the last columns (file_name, label)
+
+            # Extract the corresponding frequencies from the same row in the freq_chunk
+            frequencies = freq_chunk.iloc[idx, :-2].values  # Exclude the last columns (file_name, label)
+
+            # Count the number of NaN and 0 values in the fluxes and frequencies
+            fluxes = pd.to_numeric(row[:-2], errors='coerce').values  # Exclude and convert to numeric
+            frequencies = pd.to_numeric(freq_chunk.iloc[idx, :-2], errors='coerce').values  # Same for frequencies
+
+            num_nan = np.isnan(fluxes).sum() + np.isnan(frequencies).sum()  # Count NaN values
+            num_zero = (fluxes == 0).sum() + (frequencies == 0).sum()  # Count zero values
+
+            if num_nan > limit and idx > edge_limit and idx < len(fluxes) - edge_limit:
+                nan_files.append(row['file_name'])
+                continue
+
+            if num_zero > limit and idx > edge_limit and idx < len(fluxes) - edge_limit:
+                nan_files.append(row['file_name'])
+                continue
+
+            # Remove NaN values
+            fluxes = fluxes[~np.isnan(fluxes)]
+            frequencies = frequencies[~np.isnan(frequencies)]
+
+            # Interpolate to fill in missing values
+            f = interp1d(frequencies, fluxes, kind='linear', fill_value="extrapolate")
+            new_frequencies = np.linspace(frequencies.min(), frequencies.max(), len(row[:-2].values))
+
+            # Interpolated flux values
+            interpolated_fluxes = f(new_frequencies)
+
+            # Store the interpolated data along with labels and other metadata
+            interpolated_data = {f'flux_{i}': value for i, value in enumerate(interpolated_fluxes)}
+
+            # Add the original metadata back (e.g., file_name, label, row)
+            interpolated_data['file_name'] = row['file_name']
+            interpolated_data['label'] = row['label']
+
+            # Append the interpolated data to the results list
+            results_list.append(interpolated_data)
+
+        # Save the chunk results
+        if os.path.exists(output_dir):
+            existing_df = pd.read_pickle(output_dir)  # Load existing data
+            new_df = pd.DataFrame(results_list)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            combined_df.to_pickle(output_dir)  # Save combined DataFrame
+        else:
+            pd.DataFrame(results_list).to_pickle(output_dir)
+
+    return nan_files
+import os
+import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+
+def interpolate_spectrum(fluxes_loc, frequencies_loc, output_dir, limit=10):
+    """Interpolates the flux values to fill in missing data points."""
+    # Load the data from the pickle file
+    df_flux = pd.read_pickle(fluxes_loc).reset_index(drop=True)  # Reset index for zero-based iteration
+    df_freq = pd.read_pickle(frequencies_loc).reset_index(drop=True)  # Same for df_freq
+
+    # Initialize an empty list to store the results before concatenating into a DataFrame
+    results_list = []
+
+    # Initialize lists to store problematic file_names
+    nan_files = []  
+
+    # Count the number of successful interpolations
+    cnt_sucess = 0
+
+    # Overwrite the output file at the beginning
+    if os.path.exists(output_dir):
+        os.remove(output_dir)
+
+    # Loop through each row in the DataFrame (each row is a spectrum) with tqdm for progress bar
+    for index, row in tqdm(df_flux.iterrows(), total=len(df_flux), desc='Interpolating spectra'):
+
+        # Extract the fluxes (assuming they start at column 0 and continue to the last column)
+        fluxes = row[:-3].values  # Exclude the last columns (file_name, label, row)
+
+        # Extract the frequencies
+        frequencies = df_freq.iloc[int(index), :-3].values  # Exclude the last columns (file_name, label, row)
+
+        # Count the number of NaN and 0 values in the fluxes and frequencies
+        fluxes = pd.to_numeric(row[:-3], errors='coerce').values  # Exclude and convert to numeric
+        frequencies = pd.to_numeric(df_freq.iloc[index, :-3], errors='coerce').values  # Same for frequencies
+        num_nan = np.isnan(fluxes).sum() + np.isnan(frequencies).sum()  # Count NaN values
+        num_zero = (fluxes == 0).sum() + (frequencies == 0).sum()  # Count zero values
+
+        # Special handling for NaN values, counting nans in sequence, except for the first and last 10
+        if num_nan > limit and index > limit and index < len(fluxes)-limit:
+            num_nan_seq = 0
+            for i in range(len(fluxes)):
+                if np.isnan(fluxes[i]) or np.isnan(frequencies[i]):
+                    num_nan_seq += 1
+                else:
+                    num_nan_seq = 0
+                if num_nan_seq > limit:
+                    nan_files.append(row['file_name'])
+                    break
+            continue
+        if num_zero > limit and index > limit and index < len(fluxes)-limit:
+            num_zero_seq = 0
+            for i in range(len(fluxes)):
+                if fluxes[i] == 0 or frequencies[i] == 0:
+                    num_zero_seq += 1
+                else:
+                    num_zero_seq = 0
+                if num_zero_seq > limit:
+                    nan_files.append(row['file_name'])
+                    break
+            continue
+
+        # Deal with NaN values
+        fluxes = fluxes[~np.isnan(fluxes)]
+        frequencies = frequencies[~np.isnan(fluxes)]
+
+        # Interpolate to fill in missing values
+        f = interp1d(frequencies, fluxes, kind='linear', fill_value="extrapolate")
+        new_frequencies = np.linspace(frequencies.min(), frequencies.max(), len(row[:-3].values))
+
+        # Interpolated flux values
+        interpolated_fluxes = f(new_frequencies)
+
+        # Store the interpolated data along with labels and other metadata
+        # Create a dictionary for the interpolated spectrum
+        interpolated_data = {f'flux_{i}': value for i, value in enumerate(interpolated_fluxes)}
+
+        # Add the original metadata back (e.g., file_name, label, row)
+        interpolated_data['file_name'] = row['file_name']
+        interpolated_data['label'] = row['label']
+        
+        # Append the interpolated data to the results list
+        results_list.append(interpolated_data)
+
+        if index % 5000 == 0:  # Save every 100 rows
+            # Check if the output file already exists
+            if os.path.exists(output_dir):
+                existing_df = pd.read_pickle(output_dir)  # Load existing data
+                new_df = pd.DataFrame(results_list)
+                # Concatenate existing and new data
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                combined_df.to_pickle(output_dir)  # Save combined DataFrame
+            else:
+                # If the file doesn't exist, create a new DataFrame and save
+                pd.DataFrame(results_list).to_pickle(output_dir)
+            cnt_sucess += len(results_list)  # Increment the count of successful interpolations
+            results_list = []  # Clear list to free memory
+
+    print(f"Initial number of rows: {len(df_flux)}")
+
+    # After the loop, save any remaining results
+    if results_list:
+        if os.path.exists(output_dir):
+            existing_df = pd.read_pickle(output_dir)
+            new_df = pd.DataFrame(results_list)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+            combined_df.to_pickle(output_dir)
+        else:
+            pd.DataFrame(results_list).to_pickle(output_dir)
+        cnt_sucess += len(results_list)
+    print(f"Number of rows after removing NaN/zero values: {cnt_sucess}")
+    print(f"Interpolation complete. Number of NaN files: {len(nan_files)}")
+
+    return nan_files
+import os
+import h5py
+from astropy.io import fits
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import random
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def convert_fits_to_h5(fits_file, h5_file, target_length=3748):
+    """Converts a single FITS file to HDF5 format."""
+    try:
+        with fits.open(fits_file) as hdul:
+            if len(hdul) > 0:  # Check if the Primary HDU exists
+                spectra_data = hdul[0].data  # Assuming the spectra data is in the Primary HDU
+                if spectra_data is not None:
+                    spectra_data = spectra_data[:target_length]  # Trim to target length if necessary
+                    
+                    # Save to HDF5
+                    with h5py.File(h5_file, 'w') as hf:
+                        hf.create_dataset('spectra', data=spectra_data)
+                else:
+                    logging.error(f"{fits_file} does not contain data in the Primary HDU")
+            else:
+                logging.error(f"{fits_file} does not contain the expected HDU")
+    except Exception as e:
+        logging.error(f"Error converting {fits_file} to {h5_file}: {e}")
+
+def batch_convert_fits_to_h5(file_list, target_dir, target_length=3748):
+    """Convert a batch of FITS files to HDF5 format."""
+    os.makedirs(target_dir, exist_ok=True)  # Create target directory if it doesn't exist
+    
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(convert_fits_to_h5, fits_file, os.path.join(target_dir, os.path.splitext(os.path.basename(fits_file))[0] + ".h5"), target_length) for fits_file in file_list]
+        for future in futures:
+            future.result()  # Wait for all threads to complete
+
+    logging.info(f"All FITS files converted to HDF5 and saved in {target_dir}")
+
+def generate_file_list_from_directories(base_dirs, limit_per_dir=10000):
+    """Generates a list of files and labels from the pre-separated directories."""
+    spectra_dirs = {
+        "gal_spectra": 0,  # Label 0 for galaxies
+        "star_spectra": 1,  # Label 1 for stars
+        "agn_spectra": 2,   # Label 2 for AGNs
+        "bin_spectra": 3    # Label 3 for binary stars
+    }
+
+    file_list = []
+    labels = []
+
+    logging.info("Gathering FITS files from pre-separated directories...")
+    for dir_name, label in spectra_dirs.items():
+        for base_dir in base_dirs:
+            dir_path = os.path.join(base_dir, dir_name)
+            if os.path.exists(dir_path):
+                logging.info(f"Checking directory: {dir_path}")
+                dir_files = os.listdir(dir_path)
+                logging.info(f"Found {len(dir_files)} files in {dir_path}")
+
+                # Collect all files in the directory
+                for file in dir_files:
+                    file_path = os.path.join(dir_path, file)
+                    file_list.append(file_path)
+
+                # Randomly select files up to the limit
+                if len(file_list) > limit_per_dir:
+                    selected_files = random.sample(file_list, limit_per_dir)
+                else:
+                    selected_files = file_list
+
+                # Append selected files and their labels
+                labels.extend([label] * len(selected_files))
+
+    logging.info(f"Total spectra files collected: {len(file_list)}")
+    return file_list, labels
+
+# Convert all FITS files to HDF5
+train_files, train_labels = generate_file_list_from_directories(["training_set"], limit_per_dir=10000)
+val_files, val_labels = generate_file_list_from_directories(["validation_set"], limit_per_dir=10000)
+
+batch_convert_fits_to_h5(train_files, "training_h5")
+batch_convert_fits_to_h5(val_files, "validation_h5")
+
+
+import os
+import numpy as np
+from astropy.io import fits
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import random
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def convert_fits_to_npy(fits_file, npy_file, target_length=3748):
+    """Converts a single FITS file to NumPy format."""
+    try:
+        with fits.open(fits_file) as hdul:
+            if len(hdul) > 0:  # Check if the Primary HDU exists
+                spectra_data = hdul[0].data  # Assuming the spectra data is in the Primary HDU
+                if spectra_data is not None:
+                    spectra_data = spectra_data[:target_length]  # Trim to target length if necessary
+                    
+                    # Save to NumPy array
+                    np.save(npy_file, spectra_data)
+                else:
+                    logging.error(f"{fits_file} does not contain data in the Primary HDU")
+            else:
+                logging.error(f"{fits_file} does not contain the expected HDU")
+    except Exception as e:
+        logging.error(f"Error converting {fits_file} to {npy_file}: {e}")
+
+def batch_convert_fits_to_npy(file_list, target_dir, target_length=3748):
+    """Convert a batch of FITS files to NumPy format."""
+    os.makedirs(target_dir, exist_ok=True)  # Create target directory if it doesn't exist
+    
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(convert_fits_to_npy, fits_file, os.path.join(target_dir, os.path.splitext(os.path.basename(fits_file))[0] + ".npy"), target_length) for fits_file in file_list]
+        for future in futures:
+            future.result()  # Wait for all threads to complete
+
+    logging.info(f"All FITS files converted to NumPy arrays and saved in {target_dir}")
+
+def generate_file_list_from_directories(base_dirs, limit_per_dir=10000):
+    """Generates a list of files and labels from the pre-separated directories."""
+    spectra_dirs = {
+        "gal_spectra": 0,  # Label 0 for galaxies
+        "star_spectra": 1,  # Label 1 for stars
+        "agn_spectra": 2,   # Label 2 for AGNs
+        "bin_spectra": 3    # Label 3 for binary stars
+    }
+
+    file_list = []
+    labels = []
+
+    logging.info("Gathering FITS files from pre-separated directories...")
+    for dir_name, label in spectra_dirs.items():
+        for base_dir in base_dirs:
+            dir_path = os.path.join(base_dir, dir_name)
+            if os.path.exists(dir_path):
+                logging.info(f"Checking directory: {dir_path}")
+                dir_files = os.listdir(dir_path)
+                logging.info(f"Found {len(dir_files)} files in {dir_path}")
+
+                # Collect all files in the directory
+                for file in dir_files:
+                    file_path = os.path.join(dir_path, file)
+                    file_list.append(file_path)
+
+                # Randomly select files up to the limit
+                if len(file_list) > limit_per_dir:
+                    selected_files = random.sample(file_list, limit_per_dir)
+                else:
+                    selected_files = file_list
+
+                # Append selected files and their labels
+                labels.extend([label] * len(selected_files))
+
+    logging.info(f"Total spectra files collected: {len(file_list)}")
+    return file_list, labels
+
+# Convert all FITS files to NumPy arrays
+train_files, train_labels = generate_file_list_from_directories(["training_set/bin_spectra"], limit_per_dir=10000)
+val_files, val_labels = generate_file_list_from_directories(["validation_set/bin_spectra"], limit_per_dir=10000)
+
+batch_convert_fits_to_npy(train_files, "training_npy/bin_spectra")
+batch_convert_fits_to_npy(val_files, "validation_npy/bin_spectra")
