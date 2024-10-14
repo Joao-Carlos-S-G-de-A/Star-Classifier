@@ -1822,3 +1822,68 @@ val_files, val_labels = generate_file_list_from_directories(["validation_set/bin
 
 batch_convert_fits_to_npy(train_files, "training_npy/bin_spectra")
 batch_convert_fits_to_npy(val_files, "validation_npy/bin_spectra")
+# open the pkl file with the list of files to drop
+nan_gaia = pd.read_pickle("Pickles/drops/gaiaall.pkl")
+num_to_remove = len(nan_gaia)
+num_removed = 0
+
+
+# Training dataset
+# GALAXIES
+df = pd.read_pickle('Pickles/lmst/interpolated_data/val_gal.pkl')
+lenghtpre = len(df)
+df = df[~df['file_name'].isin(nan_gaia)]    
+print(f"GALAXIES: Number of rows before dropping: {lenghtpre} and after dropping: {len(df)}")
+num_removed += lenghtpre - len(df)
+df.to_pickle('Pickles/lmst/interpolated_data/val_gal2.pkl')
+
+# BINARY STARS
+df = pd.read_pickle('Pickles/lmst/interpolated_data/val_bin.pkl')
+lenghtpre = len(df)
+df = df[~df['file_name'].isin(nan_gaia)]
+print(f"BINARY STARS: Number of rows before dropping: {lenghtpre} and after dropping: {len(df)}")
+num_removed += lenghtpre - len(df)
+df.to_pickle('Pickles/lmst/interpolated_data/val_bin2.pkl')
+
+# AGNs
+df = pd.read_pickle('Pickles/lmst/interpolated_data/val_agn.pkl')
+lenghtpre = len(df)
+df = df[~df['file_name'].isin(nan_gaia)]
+print(f"AGNs: Number of rows before dropping: {lenghtpre} and after dropping: {len(df)}")
+num_removed += lenghtpre - len(df)
+df.to_pickle('Pickles/lmst/interpolated_data/val_agn2.pkl')
+
+# STARS
+df = pd.read_pickle('Pickles/lmst/interpolated_data/val_star.pkl')
+lenghtpre = len(df)
+df = df[~df['file_name'].isin(nan_gaia)]
+print(f"STARS: Number of rows before dropping: {lenghtpre} and after dropping: {len(df)}")
+num_removed += lenghtpre - len(df)
+print(f"Total number of rows removed: {num_removed} out of {num_to_remove}")
+df.to_pickle('Pickles/lmst/interpolated_data/val_star2.pkl')
+
+# remove bad lamost spectra from gaia dataframes whose obsid is in bad_lamost
+print("len(binary) before removing bad lamost spectra:", len(vbingaia))
+vbingaia = vbingaia[~vbingaia["obsid"].isin(bad_lamost)]
+print("len(binary) after removing bad lamost spectra:", len(vbingaia))
+
+print("len(star) before removing bad lamost spectra:", len(vstargaia))
+vstargaia = vstargaia[~vstargaia["obsid"].isin(bad_lamost)]
+print("len(star) after removing bad lamost spectra:", len(vstargaia))
+
+print("len(gal) before removing bad lamost spectra:", len(vgalgaia))
+vgalgaia = vgalgaia[~vgalgaia["obsid"].isin(bad_lamost)]
+print("len(gal) after removing bad lamost spectra:", len(vgalgaia))
+
+print("len(agn) before removing bad lamost spectra:", len(vagngaia))
+vagngaia = vagngaia[~vagngaia["obsid"].isin(bad_lamost)]
+print("len(agn) after removing bad lamost spectra:", len(vagngaia))
+
+# Make the folder for the cleaned dataframes
+!mkdir Pickles/vcleaned4
+
+# Save the cleaned dataframes
+vbingaia.to_pickle("Pickles/vcleaned4/bin_gaia.pkl")
+vstargaia.to_pickle("Pickles/vcleaned4/star_gaia.pkl")
+vgalgaia.to_pickle("Pickles/vcleaned4/gal_gaia.pkl")
+vagngaia.to_pickle("Pickles/vcleaned4/agn_gaia.pkl")
