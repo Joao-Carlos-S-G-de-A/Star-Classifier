@@ -2116,3 +2116,164 @@ num_classes = len(np.unique(y_val))
 model = create_convnet(input_shape, num_classes)
 train_convnet_many_times(model, train_generator, val_generator, epochs_per_run=1, num_runs=10)
 print_confusion_matrix(model, X_val, y_val)
+
+# Custom BalancedDataGenerator class for training
+class BalancedDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, X, y, batch_size=32, limit_per_label=1600):
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.limit_per_label = limit_per_label
+        self.classes = np.unique(y)
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.floor(len(self.indices) / self.batch_size))
+
+    def __getitem__(self, index):
+        indices = self.indices[index*self.batch_size:(index+1)*self.batch_size]
+        X_batch = self.X[indices]
+        y_batch = self.y[indices]
+        return X_batch, y_batch
+
+    def on_epoch_end(self):
+        self.indices = []
+        for cls in self.classes:
+            cls_indices = np.where(self.y == cls)[0]
+            if len(cls_indices) > self.limit_per_label:
+                cls_indices = np.random.choice(cls_indices, self.limit_per_label, replace=False)
+            self.indices.extend(cls_indices)
+        np.random.shuffle(self.indices)
+
+# Custom BalancedDataGenerator class for validation (400 per class)
+class BalancedValidationGenerator(tf.keras.utils.Sequence):
+    def __init__(self, X, y, batch_size=32, limit_per_label=400):
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.limit_per_label = limit_per_label
+        self.classes = np.unique(y)
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.floor(len(self.indices) / self.batch_size))
+
+    def __getitem__(self, index):
+        indices = self.indices[index*self.batch_size:(index+1)*self.batch_size]
+        X_batch = self.X[indices]
+        y_batch = self.y[indices]
+        return X_batch, y_batch
+
+    def on_epoch_end(self):
+        self.indices = []
+        for cls in self.classes:
+            cls_indices = np.where(self.y == cls)[0]
+            if len(cls_indices) > self.limit_per_label:
+                cls_indices = np.random.choice(cls_indices, self.limit_per_label, replace=False)
+            self.indices.extend(cls_indices)
+        np.random.shuffle(self.indices)
+
+# Create the Conv1D model
+def create_convnet(input_shape, num_classes, 
+                   num_filters=[128, 128, 128, 128, 128, 128, 128, 128], 
+                   kernel_size=9,
+                   dense_units1=256, 
+                   dense_units2=128,
+                   dense_units3=64,
+                   dropout_rate=0.2,
+                   padding='same'):
+    model = tf.keras.models.Sequential()
+    
+    # First convolutional layer
+    model.add(tf.keras.layers.Conv1D(filters=num_filters[0], kernel_size=kernel_size, 
+                                     activation='relu', input_shape=input_shape, padding=padding))
+    model.add(tf.keras.layers.MaxPooling1D(pool_size=2))
+    
+    # Additional convolutional layers
+    for filters in num_filters[1:]:
+        model.add(tf.keras.layers.Conv1D(filters=filters, kernel_size=kernel_size, 
+                                         activation='relu', padding=padding))
+        model.add(tf.keras.layers.MaxPooling1D(pool_size=2))
+        model.add(tf.keras.layers.Dropout(rate=dropout_rate))
+    
+    # Flatten the output and add dense layers
+    model.add(tf.keras.layers.Flatten())
+    model.add(tf.keras.layers.Dense(units=dense_units1, activation='relu'))
+    model.add(tf.keras.layers.Dropout(rate=dropout_rate))
+
+    # Adding another dense layer
+    if dense_units2:
+        model.add(tf.keras.layers.Dense(units=dense_units2, activation='relu'))
+        model.add(tf.keras.layers.Dropout(rate=dropout_rate))
+
+    # Adding another dense layer
+    if dense_units3:
+        model.add(tf.keras.layers.Dense(units=dense_units3, activation='relu'))
+        model.add(tf.keras.layers.Dropout(rate=dropout_rate))
+    
+    # Output layer
+    model.add(tf.keras.layers.Dense(units=num_classes, activation='softmax'))
+
+    # Optimizer and loss function
+    optimizer_ = tf.keras.optimizers.AdamW(learning_rate=1e-4) 
+
+    # Compile the model
+    model.compile(optimizer=optimizer_, 
+                  loss='sparse_categorical_crossentropy', 
+                  metrics=['accuracy'])
+    
+    return model
+
+# Function to train the model
+def train_convnet(model, train_dataset, val_dataset, limit_per_label=1600, epochs=1, batch_size=32, patience=5):
+    # Define early stopping callback
+    early_stopping = EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)
+
+    # Fit the model
+    history = model.fit(train_dataset,
+                        validation_data=val_dataset,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        callbacks=[early_stopping])
+    
+    return history
+
+# Function to train the model multiple times
+def train_convnet_many_times(model, train_dataset, val_dataset, epochs_per_run=1, batch_size=32, num_runs=10, limit_per_label=1600):
+    histories = []
+    for i in range(num_runs):
+        print(f"Training run {i+1}/{num_runs}...")
+        history = train_convnet(model, train_dataset, val_dataset, limit_per_label=limit_per_label, epochs=epochs_per_run, batch_size=batch_size)
+        histories.append(history)
+    
+    return histories
+
+# Function to print confusion matrix and classification report
+def print_confusion_matrix(convnet_model, val_spectra, val_labels):   
+    val_predictions = convnet_model.predict(val_spectra)
+    predicted_labels = np.argmax(val_predictions, axis=1)
+    true_labels = np.array(val_labels)
+
+    conf_matrix = confusion_matrix(true_labels, predicted_labels)
+    print("Confusion Matrix:")
+    print(conf_matrix)
+
+    print("\nClassification Report:")
+    print(classification_report(true_labels, predicted_labels))
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_matrix, annot=True, fmt="d", cmap="Blues", xticklabels=['Star', 'Binary Star','Galaxy', 'AGN'], yticklabels=['Star', 'Binary Star','Galaxy', 'AGN'])
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+# Load and preprocess data
+X = pd.read_pickle("Pickles/fusionv0/all.pkl")
+y = X["label"]
+label_mapping = {'star': 0, 'binary_star': 1, 'galaxy': 2, 'agn': 3}
+y = y.map(label_mapping) if isinstance(y, pd.Series) else np.vectorize(label_mapping.get)(y)
+
+X = X.drop(["parallax", "ra", "dec", "ra_error", "dec_error", "parallax_error", "pmra", "pmdec", "pmra_error", "pmdec_error", 
+            "phot_g_mean_flux", "flagnopllx", "phot_g_mean_flux_error", "phot_bp_mean_flux", "phot_rp_mean_flux", 
+            "phot_bp_mean_flux_error", "phot_rp_mean_flux_error", "obsid", "label"], axis=1)
