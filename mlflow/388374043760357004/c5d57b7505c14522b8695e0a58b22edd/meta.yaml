@@ -1,8 +1,9 @@
 artifact_uri: file:///C:/Users/jcwin/OneDrive - University of Southampton/_Southampton/2024-25/Star-Classifier/mlflow/388374043760357004/c5d57b7505c14522b8695e0a58b22edd/artifacts
+deleted_time: 1729257674684
 end_time: 1729184421103
 entry_point_name: ''
 experiment_id: '388374043760357004'
-lifecycle_stage: active
+lifecycle_stage: deleted
 run_id: c5d57b7505c14522b8695e0a58b22edd
 run_name: victorious-owl-838
 run_uuid: c5d57b7505c14522b8695e0a58b22edd
