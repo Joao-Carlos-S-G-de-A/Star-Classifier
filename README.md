@@ -1,15 +1,14 @@
 # Star Classifier
  
-## Note: This project is still underway.
+Note: This project is still underway.
 
-## Abstract for reference:
+Abstract for reference:
 
-### Classifying Every Star: Applying Multimodal Deep Learning to Make Sense of
-### Vast Astronomical Data Sets
+### Classifying Every Star: Applying Multimodal Deep Learning to Make Sense of Vast Astronomical Data Sets
 
-### Authors: J. Schymura-Gomes-de-Almeida1, C. Knigge1, S. Scaringi 2
-### 1 School of Physics & Astronomy, University of Southampton, Southampton SO17 1BJ, UK
-### 2 Centre for Extragalactic Astronomy, Durham University, Durham DH1 3LE, UK
+Authors: J. Schymura-Gomes-de-Almeida1, C. Knigge1, S. Scaringi 2
+1 School of Physics & Astronomy, University of Southampton, Southampton SO17 1BJ, UK
+2 Centre for Extragalactic Astronomy, Durham University, Durham DH1 3LE, UK
 
 Astronomy has rapidly evolved into a data-rich science, with missions such as Gaia mapping nearly 2
 billion objects and LAMOST producing over 10 million spectra. These extensive surveys offer unprece-
