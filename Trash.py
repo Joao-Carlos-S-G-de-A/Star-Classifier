@@ -2823,3 +2823,13 @@ model.summary()
 histories = train_convnet_many_times(model, train_generator, val_generator, epochs_per_run=1, num_runs=10)
 
 print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+# Initialize model with Gaia input size
+gaia_input_size = X_train_gaia.shape[1]
+print(f"Gaia input size: {gaia_input_size}")
+filters=[128, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 1024]
+dense=[2048, 2048 , 1024, 512, 256, 64]
+
+model = ConvNetFusion(input_shape=(3748,), num_classes=4, gaia_input_size=gaia_input_size, 
+                      num_filters=filters, kernel_size=9, dense_units=dense, dropout_rate=0.2, gaia_fusion_units=1024)
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
