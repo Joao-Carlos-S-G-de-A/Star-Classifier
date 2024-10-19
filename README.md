@@ -1,11 +1,11 @@
 # Star Classifier
  
-This project is still underway.
+## Note: This project is still underway.
 
-Abstract for reference:
+## Abstract for reference:
 
-Classifying Every Star: Applying Multimodal Deep Learning to Make Sense of
-Vast Astronomical Data Sets
+### Classifying Every Star: Applying Multimodal Deep Learning to Make Sense of
+### Vast Astronomical Data Sets
 
 Authors: J. Schymura-Gomes-de-Almeida1, C. Knigge1, S. Scaringi 2
 1 School of Physics & Astronomy, University of Southampton, Southampton SO17 1BJ, UK
