@@ -7,7 +7,9 @@ Abstract for reference:
 ### Classifying Every Star: Applying Multimodal Deep Learning to Make Sense of Vast Astronomical Data Sets
 
 Authors: J. Schymura-Gomes-de-Almeida <sup> 1 </sup>, C. Knigge <sup>1</sup>, S. Scaringi <sup>2</sup>
+
 <sup>1</sup> School of Physics & Astronomy, University of Southampton, Southampton SO17 1BJ, UK
+
 <sup>2</sup> Centre for Extragalactic Astronomy, Durham University, Durham DH1 3LE, UK
 
 Astronomy has rapidly evolved into a data-rich science, with missions such as Gaia mapping nearly 2
