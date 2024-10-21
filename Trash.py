@@ -2833,3 +2833,237 @@ model = ConvNetFusion(input_shape=(3748,), num_classes=4, gaia_input_size=gaia_i
                       num_filters=filters, kernel_size=9, dense_units=dense, dropout_rate=0.2, gaia_fusion_units=1024)
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+
+# MAYBE ADD THIS TO THE MAIN SCRIPT
+# Initialize model with Gaia input size
+gaia_input_size = X_train_gaia.shape[1]
+print(f"Gaia input size: {gaia_input_size}")
+filters=[128, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 1024]
+dense=[2048, 2048 , 1024, 512, 256, 64]
+
+model = ConvNetFusion(input_shape=(3748,), num_classes=4, gaia_input_size=gaia_input_size, 
+                      num_filters=filters, kernel_size=9, dense_units=dense, dropout_rate=0.2, gaia_fusion_units=1024)
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+# Initialize the model
+gaia_input_size = X_train_gaia.shape[1]
+filters = [128, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512]
+dense = [1024, 1024, 512, 256, 64]
+
+model = ConvNetFusion(input_shape=(3748,), num_classes=4, gaia_input_size=gaia_input_size, 
+                      num_filters=filters, kernel_size=9, dense_units=dense, dropout_rate=0.2, gaia_fusion_units=512)
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+# Training parameters
+num_epochs = 200
+lr = 1e-4
+patience = 10
+batch_size = 512
+
+# Start an MLflow run
+with mlflow.start_run(log_system_metrics=True):
+    # Log parameters
+    mlflow.log_param("num_epochs", num_epochs)
+    mlflow.log_param("lr", lr)
+    mlflow.log_param("patience", patience)
+    mlflow.log_param("batch_size", batch_size)
+    mlflow.log_param("num_filters", filters)
+    mlflow.log_param("dense_units", dense)
+    mlflow.log_param("dropout_rate", 0.2)
+    mlflow.log_param("kernel_size", 20)
+
+    # Train the model
+    trained_model = train_model(model, train_loader, val_loader, num_epochs=num_epochs, lr=lr, patience=patience)
+
+    # Evaluate the model
+    print_confusion_matrix(trained_model, val_loader)
+    # Save the model in MLflow
+    #mlflow.pytorch.log_model(trained_model, "model")
+
+    import torch
+import torch.nn as nn
+
+class ConvNetFusion(nn.Module):
+    def __init__(self, input_shape, num_classes, gaia_input_size, 
+                 num_filters=[128, 128, 128, 128],  # Reduced for simplicity
+                 kernel_size=9,
+                 dense_units=[256, 128, 64, 32],
+                 dropout_rate=0.2, 
+                 gaia_fusion_units=10000):
+        super(ConvNetFusion, self).__init__()
+
+        # Spectra input path: Conv1D layers and pooling layers
+        for i, filters in enumerate(num_filters):
+            if i == 0:
+                self.conv_layers = nn.Sequential(
+                    nn.Conv1d(in_channels=1, out_channels=filters, kernel_size=kernel_size, padding=kernel_size//2),
+                    nn.ReLU(),
+                    nn.MaxPool1d(kernel_size=2)
+                )
+            else:
+                self.conv_layers.add_module(f"conv_{i}", nn.Conv1d(in_channels=num_filters[i-1], out_channels=filters, kernel_size=kernel_size, padding=kernel_size//2))
+                self.conv_layers.add_module(f"relu_{i}", nn.ReLU())
+                self.conv_layers.add_module(f"pool_{i}", nn.MaxPool1d(kernel_size=2))
+        
+        # Compute the flattened output size (based on input shape and pooling)
+        final_seq_len = input_shape[0] // (2 ** len(num_filters))  # After all pooling layers
+        spectra_out_size = num_filters[-1] * final_seq_len
+
+        # Gaia input path: Dense layer to project Gaia input features
+        self.gaia_branch = nn.Sequential(
+            nn.Linear(gaia_input_size, gaia_fusion_units),
+            nn.ReLU()
+        )
+        
+        # Concatenation of Spectra and Gaia features
+        fused_input_size = spectra_out_size + gaia_fusion_units
+        
+        # Fully connected layers after fusion
+        for i, units in enumerate(dense_units):
+            if i == 0:
+                self.dense_layers = nn.Sequential(
+                    nn.Linear(fused_input_size, units),
+                    nn.ReLU(),
+                    nn.Dropout(dropout_rate)
+                )
+            else:
+                self.dense_layers.add_module(f"dense_{i}", nn.Linear(dense_units[i-1], units))
+                self.dense_layers.add_module(f"relu_{i}", nn.ReLU())
+                self.dense_layers.add_module(f"dropout_{i}", nn.Dropout(dropout_rate))
+        
+        # Output layer
+        self.output_layer = nn.Linear(dense_units[-1], num_classes)
+    
+    def forward(self, x_conv, x_gaia):
+        # Spectra branch forward pass
+        x_conv = self.spectra_branch(x_conv)
+        x_conv = torch.flatten(x_conv, start_dim=1)  # Flatten for dense layers
+        
+        # Gaia branch forward pass
+        x_gaia = self.gaia_branch(x_gaia)
+        
+        # Concatenate the two branches
+        x_fused = torch.cat((x_conv, x_gaia), dim=1)
+        
+        # Pass through dense layers
+        x = self.dense_layers(x_fused)
+        
+        # Output layer
+        x = self.output_layer(x)
+        
+        return torch.softmax(x, dim=1)
+
+# Initialize toy model
+gaia_input_size = X_train_gaia.shape[1]
+print(f"Gaia input size: {gaia_input_size}")
+filters = [16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 128]
+dense=[256, 256 , 256 ,128, 64, 32]
+
+model = ConvNetFusion(input_shape=(3748,), num_classes=4, gaia_input_size=gaia_input_size, 
+                      num_filters=filters, kernel_size=9, dense_units=dense, dropout_rate=0.2, gaia_fusion_units=128)
+# Save the model
+torch.save(model, "Models/toyv0.pth")
+# Print model summary
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+# Training parameters
+num_epochs = 20
+lr = 1e-4
+patience = 20
+batch_size = 512
+
+# Start an MLflow run
+with mlflow.start_run(log_system_metrics=True):
+    # Log parameters
+    mlflow.log_param("num_epochs", num_epochs)
+    mlflow.log_param("lr", lr)
+    mlflow.log_param("patience", patience)
+    mlflow.log_param("batch_size", batch_size)
+    mlflow.log_param("num_filters", filters)
+    mlflow.log_param("dense_units", dense)
+    mlflow.log_param("dropout_rate", 0.2)
+    mlflow.log_param("kernel_size", 20)
+
+    # Train the model
+    trained_model = train_model(model, train_loader, val_loader, test_loader, num_epochs=num_epochs, lr=lr, patience=patience)
+
+    # Evaluate the model
+    print_confusion_matrix(trained_model, val_loader)
+class ConvNetFusion(nn.Module):
+    def __init__(self, input_shape, num_classes, gaia_input_size, 
+                 num_filters=[128, 128, 128, 128, 128, 128, 128, 128], 
+                 kernel_size=9,
+                 dense_units=[256, 256, 256, 128, 128, 128, 64, 64, 64],
+                 dropout_rate=0.2, 
+                 gaia_fusion_units=128,
+                 padding='same'):
+        super(ConvNetFusion, self).__init__()
+        
+        self.conv_layers = nn.ModuleList()
+        self.pool_layers = nn.ModuleList()
+        in_channels = 1  # Since it's a 1D input
+        
+        # Convolutional layers for spectra
+        for filters in num_filters:
+            conv_layer = nn.Conv1d(in_channels=in_channels, out_channels=filters, kernel_size=kernel_size, padding=kernel_size//2)
+            self.conv_layers.append(conv_layer)
+            self.pool_layers.append(nn.MaxPool1d(kernel_size=2))
+            in_channels = filters
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        self.flatten = nn.Flatten()
+        
+        # Compute the flattened output size (based on input shape and pooling)
+        final_seq_len = input_shape[0] // (2 ** len(num_filters))  # After all pooling layers
+        
+        # Separate input for Gaia features
+        self.gaia_input_layer = nn.Linear(gaia_input_size, gaia_fusion_units)
+
+        # Add dense layers
+        dense_input_units = num_filters[-1] * final_seq_len + gaia_fusion_units  # Combine convnet output and Gaia features
+        self.dense_layers = nn.ModuleList()
+        for units in dense_units:
+            self.dense_layers.append(nn.Linear(dense_input_units, units))
+            dense_input_units = units
+        
+        # Output layer
+        self.output_layer = nn.Linear(dense_input_units, num_classes)
+    
+    def forward(self, x_conv, x_gaia):
+        # Separate path for convolutional spectra data
+        for conv_layer, pool_layer in zip(self.conv_layers, self.pool_layers):
+            x_conv = pool_layer(torch.relu(conv_layer(x_conv)))
+            x_conv = self.dropout(x_conv)
+        x_conv = self.flatten(x_conv)  # Flatten after conv layers
+
+        # Separate path for Gaia features
+        x_gaia = torch.relu(self.gaia_input_layer(x_gaia))
+
+        # Concatenate both the spectra and Gaia features
+        x = torch.cat((x_conv, x_gaia), dim=1)
+        
+        # Pass through dense layers
+        for dense_layer in self.dense_layers:
+            x = torch.relu(dense_layer(x))
+            x = self.dropout(x)
+        
+        # Output layer
+        x = self.output_layer(x)
+        return torch.softmax(x, dim=1)
+
+# Initialize toy model
+gaia_input_size = X_train_gaia.shape[1]
+print(f"Gaia input size: {gaia_input_size}")
+filters = [16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 128]
+dense=[256, 256 , 256 ,128, 64, 32]
+
+model = ConvNetFusion(input_shape=(3748,), num_classes=4, gaia_input_size=gaia_input_size, 
+                      num_filters=filters, kernel_size=9, dense_units=dense, dropout_rate=0.2, gaia_fusion_units=128)
+# Save the model
+torch.save(model, "Models/toyv0.pth")
+# Print model summary
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
