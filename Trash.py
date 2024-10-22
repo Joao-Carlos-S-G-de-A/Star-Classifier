@@ -3067,3 +3067,200 @@ torch.save(model, "Models/toyv0.pth")
 # Print model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+import os
+import tempfile
+import torch
+from sklearn.metrics import confusion_matrix
+import mlflow
+
+def print_confusion_matrix(model, val_loader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for X_conv, X_gaia, y in val_loader:
+            outputs = model(X_conv, X_gaia)
+            _, predicted = torch.max(outputs, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+
+    cm = confusion_matrix(all_labels, all_preds)
+    print("Confusion Matrix:")
+    print(cm)
+
+    # Log confusion matrix
+    temp_file_path = save_confusion_matrix_to_file(cm)
+    mlflow.log_artifact(temp_file_path, artifact_path="confusion_matrix")
+    os.remove(temp_file_path)  # Clean up the temporary file
+
+def save_confusion_matrix_to_file(cm):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    
+    xticklabels = ['Star', 'Binary Star', 'Galaxy', 'AGN']
+    yticklabels = ['Star', 'Binary Star', 'Galaxy', 'AGN']
+    
+    plt.xticks(ticks=[0.5, 1.5, 2.5, 3.5], labels=xticklabels, rotation=45)
+    plt.yticks(ticks=[0.5, 1.5, 2.5, 3.5], labels=yticklabels, rotation=0)
+
+    # Save the figure to a temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    plt.savefig(temp_file.name, format='png')
+    temp_file.close()
+    
+    return temp_file.name
+import os
+import tempfile
+import torch
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, f1_score, precision_score
+import mlflow
+
+def print_confusion_matrix(model, val_loader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for X_conv, X_gaia, y in val_loader:
+            outputs = model(X_conv, X_gaia)
+            _, predicted = torch.max(outputs, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+
+    cm = confusion_matrix(all_labels, all_preds)
+    print("Confusion Matrix:")
+    print(cm)
+
+    # Calculate and print additional metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    recall = recall_score(all_labels, all_preds, average='weighted')
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    precision = precision_score(all_labels, all_preds, average='weighted')
+
+    print(f"Accuracy: {accuracy}")
+    print(f"Recall: {recall}")
+    print(f"F1 Score: {f1}")
+    print(f"Precision: {precision}")
+
+    # Log confusion matrix
+    temp_file_path = save_confusion_matrix_to_file(cm)
+    mlflow.log_artifact(temp_file_path, artifact_path="confusion_matrix")
+    os.remove(temp_file_path)  # Clean up the temporary file
+
+def save_confusion_matrix_to_file(cm):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    
+    xticklabels = ['Star', 'Binary Star', 'Galaxy', 'AGN']
+    yticklabels = ['Star', 'Binary Star', 'Galaxy', 'AGN']
+    
+    plt.xticks(ticks=[0.5, 1.5, 2.5, 3.5], labels=xticklabels, rotation=45)
+    plt.yticks(ticks=[0.5, 1.5, 2.5, 3.5], labels=yticklabels, rotation=0)
+
+    # Save the figure to a temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    plt.savefig(temp_file.name, format='png')
+    temp_file.close()
+    
+    return temp_file.name   
+
+def train_model(model, train_loader, val_loader, test_loader, num_epochs=200, lr=1e-4, patience=10):
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    early_stopping_counter = 0
+    best_test_loss = float('inf')
+    epochs_no_improve = 0
+    best_model = None
+
+    for epoch in range(num_epochs):
+        # Re-sample the training dataset at the start of each epoch
+        train_loader.dataset.re_sample()
+        model.train()
+        train_loss, correct_train, total_train = 0.0, 0, 0
+
+        # Training loop
+        for X_conv, X_gaia, y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(X_conv, X_gaia)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * X_conv.size(0)
+            _, predicted = torch.max(outputs, 1)
+            correct_train += (predicted == y).sum().item()
+            total_train += y.size(0)
+
+        train_loss /= len(train_loader.dataset)
+        train_acc = correct_train / total_train
+
+        # Validation loop
+        model.eval()
+        val_loss, correct_val, total_val, test_loss, correct_test, total_test = 0, 0, 0, 0, 0, 0
+
+        with torch.no_grad():
+            for X_conv, X_gaia, y in val_loader:
+                outputs = model(X_conv, X_gaia)
+                loss = criterion(outputs, y)
+                val_loss += loss.item() * X_conv.size(0)
+                _, predicted = torch.max(outputs, 1)
+                correct_val += (predicted == y).sum().item()
+                total_val += y.size(0)
+        # Test loop
+        with torch.no_grad():
+            for X_conv, X_gaia, y in test_loader:
+                outputs = model(X_conv, X_gaia)
+                loss = criterion(outputs, y)
+                test_loss += loss.item() * X_conv.size(0)
+                _, predicted = torch.max(outputs, 1)
+                correct_test += (predicted == y).sum().item()
+                total_test += y.size(0)
+
+        val_loss /= len(val_loader.dataset)
+        val_acc = correct_val / total_val
+        test_loss /= len(test_loader.dataset)
+        test_acc = correct_test / total_test
+
+        # Log metrics for MLflow
+        mlflow.log_metric("train_loss", train_loss, step=epoch)
+        mlflow.log_metric("train_acc", train_acc, step=epoch)
+        mlflow.log_metric("val_loss", val_loss, step=epoch)
+        mlflow.log_metric("val_acc", val_acc, step=epoch)
+        mlflow.log_metric("test_loss", test_loss, step=epoch)
+        mlflow.log_metric("test_acc", test_acc, step=epoch)
+
+
+        # Early stopping
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+            if early_stopping_counter >= patience:
+                print("Early stopping triggered.")
+                break
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+        print(f"Epoch [{epoch + 1}/{num_epochs}], "
+              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
+              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, "
+              f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+
+
+    # Load the best model weights before returning
+    model.load_state_dict(best_model)
+    return model
