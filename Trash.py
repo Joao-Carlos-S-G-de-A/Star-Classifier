@@ -3264,3 +3264,12 @@ def train_model(model, train_loader, val_loader, test_loader, num_epochs=200, lr
     # Load the best model weights before returning
     model.load_state_dict(best_model)
     return model
+
+    # Define the Gaia Branch as a separate module
+class GaiaBranch(nn.Module):
+    def __init__(self, gaia_input_size, gaia_fusion_units):
+        super(GaiaBranch, self).__init__()
+        self.fc = nn.Linear(gaia_input_size, gaia_fusion_units)
+
+    def forward(self, x):
+        return torch.relu(self.fc(x))
