@@ -17,3 +17,4 @@ lamost_val_set/
 lamost_train_set/
 mlflow/
 mlruns/
+wandb/
