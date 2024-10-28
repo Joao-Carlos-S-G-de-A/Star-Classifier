@@ -3815,3 +3815,122 @@ if __name__ == "__main__":
         mlflow.log_param("learning_rate", lr)
         trained_model_vit = train_model_vit(model_vit, train_loader, val_loader, num_epochs, lr, patience)
         print_confusion_matrix_vit(trained_model_vit, val_loader)
+class VisionTransformer1D(nn.Module):
+    def __init__(self, input_size=3748, num_classes=4, patch_size=5, dim=128, depth=12, heads=16, mlp_dim=256, dropout=0.2):
+        super(VisionTransformer1D, self).__init__()
+
+        # Store patch size and dimensionality for embedding
+        self.patch_size = patch_size
+        self.dim = dim
+
+        # Patch Embedding layer
+        self.patch_embed = nn.Linear(patch_size, dim)
+
+        # Positional Encoding (initialize to a reasonable size, but we’ll adjust it dynamically)
+        max_patches = (input_size + patch_size - 1) // patch_size  # Approximate max patches
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_patches, dim))
+
+        # Transformer blocks
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout),
+            depth
+        )
+
+        # MLP Head
+        self.fc = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+
+    def forward(self, x):
+        batch_size, channels, seq_len = x.shape
+        x = x.squeeze(1) if channels == 1 else x
+        pad_length = (self.patch_size - (seq_len % self.patch_size)) % self.patch_size
+        x = nn.functional.pad(x, (0, pad_length))
+        x = x.view(batch_size, -1, self.patch_size)
+
+        x = self.patch_embed(x)
+        if torch.isnan(x).any():
+            print("NaN detected after patch embedding")
+        x += self.pos_embedding
+        
+        x = self.transformer(x)
+        if torch.isnan(x).any():
+            print("NaN detected after transformer layer")
+
+        x = self.fc(x[:, 0])
+        if torch.isnan(x).any():
+            print("NaN detected in final output layer")
+
+        return x
+
+
+
+def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500, lr=1e-5, patience=5, device='cuda'):
+    model = model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    best_val_loss = float('inf')
+    
+    for epoch in range(num_epochs):
+        train_loader.dataset.re_sample()
+        model.train()
+        train_loss = 0.0
+        
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            if torch.isnan(outputs).any():
+                print("NaN detected in model outputs")
+                continue
+            loss = criterion(outputs, y_batch)
+            if torch.isnan(loss).any():
+                print("NaN loss detected")
+                continue
+            loss.backward()
+            for param in model.parameters():
+                if torch.isnan(param.grad).any():
+                    print("NaN detected in gradients")
+                    continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item() * X_batch.size(0)
+            train_accuracy = (outputs.argmax(dim=1) == y_batch).float().mean()
+        
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_val, y_val in val_loader:
+                X_val, y_val = X_val.to(device), y_val.to(device)
+                outputs = model(X_val)
+                loss = criterion(outputs, y_val)
+                val_loss += loss.item() * X_val.size(0)
+                val_accuracy = (outputs.argmax(dim=1) == y_val).float().mean()
+        
+        test_loss = 0.0
+        test_accuracy = 0.0
+        with torch.no_grad():
+            for X_test, y_test in test_loader:
+                X_test, y_test = X_test.to(device), y_test.to(device)
+                outputs = model(X_test)
+                loss = criterion(outputs, y_test)
+                test_loss += loss.item() * X_test.size(0)
+                test_accuracy = (outputs.argmax(dim=1) == y_test).float().mean()
+
+        train_loss /= len(train_loader.dataset)
+        val_loss /= len(val_loader.dataset)
+        test_loss /= len(test_loader.dataset)
+        wandb.log({"train_loss": train_loss, "val_loss": val_loss, "epoch": epoch, 
+                   "train_accuracy": train_accuracy.item(), "val_accuracy": val_accuracy.item(), 
+                   "test_accuracy": test_accuracy.item(), "test_loss": test_loss})
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+        else:
+            patience -= 1
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+
+    return model
