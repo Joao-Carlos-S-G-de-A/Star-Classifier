@@ -8,16 +8,13 @@ import pandas as pd
 import wandb
 import gc
 from sklearn.model_selection import train_test_split
-import torch
-print("CUDA available:", torch.cuda.is_available())
-print("Number of GPUs:", torch.cuda.device_count())
-print("Current device:", torch.cuda.current_device())
 
+print(torch.__version__)
+print(torch.cuda.is_available())
 if torch.cuda.is_available():
     device = torch.device("cuda")
-else:   
+else:
     device = torch.device("cpu")
-
 
 # Create dataset classes (using your BalancedDataset approach) and training function
 class BalancedDataset(Dataset):
@@ -65,7 +62,7 @@ class BalancedValidationDataset(Dataset):
             indices.extend(cls_indices)
         np.random.shuffle(indices)
         return indices
-
+    
     def __len__(self):
         return len(self.indices)
 
@@ -73,11 +70,11 @@ class BalancedValidationDataset(Dataset):
         index = self.indices[idx]
         return self.X[index], self.y[index]
 # Training function (similar to your ConvNet setup but using WandB)
-def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=10, lr=1e-4, patience=5, device='cuda'):
+def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500, lr=1e-4, max_patience=5, device='cuda'):
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
-    best_val_loss = float('inf')
+    best_test_loss = float('inf')
     
     for epoch in range(num_epochs):
         # Re-sample training data at the start of each epoch
@@ -115,7 +112,7 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=10,
                 outputs = model(X_test)
                 loss = criterion(outputs, y_test)
                 test_loss += loss.item() * X_test.size(0)
-                test_accuracy += (outputs.argmax(dim=1) == y_test).float().mean()
+                test_accuracy = (outputs.argmax(dim=1) == y_test).float().mean()
 
 
         # Log metrics to WandB
@@ -127,8 +124,9 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=10,
                    "test_accuracy": test_accuracy.item(), "test_loss": test_loss})
         
         # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            patience = max_patience
         else:
             patience -= 1
             if patience <= 0:
@@ -137,7 +135,7 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=10,
 
     return model
 class VisionTransformer1D(nn.Module):
-    def __init__(self, input_size=3748, num_classes=4, patch_size=17, dim=128, depth=6, heads=8, mlp_dim=256, dropout=0.1):
+    def __init__(self, input_size=3748, num_classes=4, patch_size=5, dim=128, depth=12, heads=16, mlp_dim=256, dropout=0.2):
         super(VisionTransformer1D, self).__init__()
 
         # Store patch size and dimensionality for embedding
@@ -147,21 +145,15 @@ class VisionTransformer1D(nn.Module):
         # Patch Embedding layer
         self.patch_embed = nn.Linear(patch_size, dim)
 
-        # Positional Encoding (initialize to a reasonable size, but we will adjust it dynamically)
+        # Positional Encoding (initialize to a reasonable size, but we’ll adjust it dynamically)
         max_patches = (input_size + patch_size - 1) // patch_size  # Approximate max patches
         self.pos_embedding = nn.Parameter(torch.randn(1, max_patches, dim))
 
         # Transformer blocks
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout),
-            depth
-        )
+        self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout), depth)
 
         # MLP Head
-        self.fc = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, num_classes)
-        )
+        self.fc = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_classes))
 
     def forward(self, x):
         # Handle input dimensions and ensure padding for patch divisibility
@@ -188,7 +180,7 @@ class VisionTransformer1D(nn.Module):
         x = self.fc(x[:, 0])
 
         return x
-batch_size = 128
+batch_size = 256
 
 
 
@@ -200,7 +192,6 @@ if __name__ == "__main__":
     y = X["label"]
     label_mapping = {'star': 0, 'binary_star': 1, 'galaxy': 2, 'agn': 3}
     y = y.map(label_mapping).values
-    
     X = X.drop(["parallax", "ra", "dec", "ra_error", "dec_error", "parallax_error", "pmra", "pmdec", "pmra_error", "pmdec_error", 
                 "phot_g_mean_flux", "flagnopllx", "phot_g_mean_flux_error", "phot_bp_mean_flux", "phot_rp_mean_flux", 
                 "phot_bp_mean_flux_error", "phot_rp_mean_flux_error", "label"], axis=1).values
@@ -214,7 +205,7 @@ if __name__ == "__main__":
     
     # Split data
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    
+
     # Clear memory
     del X, y
     gc.collect()
@@ -233,12 +224,53 @@ if __name__ == "__main__":
     test_loader = DataLoader(BalancedValidationDataset(torch.tensor(X_test, dtype=torch.float32).unsqueeze(1),
                                                     torch.tensor(y_test, dtype=torch.long)), batch_size=batch_size, shuffle=False)
 
-torch.cuda.empty_cache()
-# Initialize WandB project
-wandb.init(project="spectra-classification-vit", entity="joaoc-university-of-southampton")
-# Initialize and train the model
-model_vit = VisionTransformer1D(patch_size=10)
-trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader, num_epochs=50, lr=1e-3, patience=10)
+# Define the hyperparameters
+num_classes = 4
+num_epochs = 300
+patience = 30
 
-# Save the model and finish WandB session
-wandb.finish()
+# Define sweep config
+sweep_config = {
+    "method": "random",
+    "metric": {"name": "test_accuracy", "goal": "maximize"},
+    "parameters": {
+        "lr": {"values": [3e-7, 3e-6, 3e-5]},
+        "patch_size": {"values": [16, 256, 3748]},
+        "dim": {"values": [32, 64, 128, 256, 512]},
+        "heads": {"values": [2, 8, 32]},
+        "mlp_dim": {"values": [64, 128, 256]}, # Adjusted for faster runs
+        #"batch_size": {"values": [64, 128, 256]},
+        "depth": {"values": [3, 10, 20]},
+        "dropout": {"values": [0.1, 0.2, 0.3, 0.4]}
+    }
+}
+
+def sweep_train():
+    with wandb.init() as run:
+        config = run.config
+        model_vit = VisionTransformer1D(
+            num_classes=num_classes,
+            patch_size=config.patch_size,
+            dim=config.dim,
+            depth=config.depth,
+            heads=config.heads,
+            mlp_dim=config.mlp_dim,
+            dropout=config.dropout
+        )
+        
+        # Pass config.num_epochs explicitly
+        trained_model = train_model_vit(
+            model_vit,
+            train_loader,
+            val_loader,
+            test_loader,
+            num_epochs=num_epochs,
+            lr=config.lr,
+            max_patience=patience,
+            device='cuda'
+        )
+
+
+# Start sweep
+sweep_id = wandb.sweep(sweep_config, project="spectra-classification-vit")
+wandb.agent(sweep_id, function=sweep_train, count=50)
