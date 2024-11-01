@@ -223,54 +223,134 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(BalancedValidationDataset(torch.tensor(X_test, dtype=torch.float32).unsqueeze(1),
                                                     torch.tensor(y_test, dtype=torch.long)), batch_size=batch_size, shuffle=False)
+    
 
 # Define the hyperparameters
 num_classes = 4
-num_epochs = 300
-patience = 30
+patch_size = 256
+dim = 256
+depth = 20
+heads = 8
+mlp_dim = 256
+dropout = 0.1
+lr = 0.0000003
+patience = 100
+num_epochs = 1000
 
-# Define sweep config
-sweep_config = {
-    "method": "random",
-    "metric": {"name": "test_accuracy", "goal": "maximize"},
-    "parameters": {
-        "lr": {"values": [3e-7, 3e-6, 3e-5]},
-        "patch_size": {"values": [16, 256, 3748]},
-        "dim": {"values": [32, 64, 128, 256, 512]},
-        "heads": {"values": [2, 8, 32]},
-        "mlp_dim": {"values": [64, 128, 256]}, # Adjusted for faster runs
-        #"batch_size": {"values": [64, 128, 256]},
-        "depth": {"values": [3, 10, 20]},
-        "dropout": {"values": [0.1, 0.2, 0.3, 0.4]}
-    }
-}
 
-def sweep_train():
-    with wandb.init() as run:
-        config = run.config
-        model_vit = VisionTransformer1D(
-            num_classes=num_classes,
-            patch_size=config.patch_size,
-            dim=config.dim,
-            depth=config.depth,
-            heads=config.heads,
-            mlp_dim=config.mlp_dim,
-            dropout=config.dropout
-        )
+# Define the config dictionary object
+config = {"num_classes": num_classes, "patch_size": patch_size, "dim": dim, "depth": depth, "heads": heads, "mlp_dim": mlp_dim, 
+          "dropout": dropout, "batch_size": batch_size, "lr": lr, "patience": patience}
+
+# Initialize WandB project
+wandb.init(project="spectra-classification-vit", entity="joaoc-university-of-southampton", config=config, mode="offline")
+# Initialize and train the model
+model_vit = VisionTransformer1D(num_classes=num_classes, patch_size=patch_size, dim=dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout)
+trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader, num_epochs=num_epochs, lr=lr, max_patience=patience)
+
+# Save the model and finish WandB session
+wandb.finish()
+
+# Adding overlapping patches to the VisionTransformer1D model
+class VisionTransformer1D(nn.Module):
+    def __init__(self, input_size=3748, num_classes=4, patch_size=20, overlap=0.5, dim=128, depth=12, heads=16, mlp_dim=256, dropout=0.2):
+        super(VisionTransformer1D, self).__init__()
+
+        # Store patch size, overlap, and dimensionality for embedding
+        self.patch_size = patch_size
+        self.overlap = overlap
+        self.dim = dim
+
+        # Calculate the stride based on the overlap percentage
+        self.stride = int(patch_size * (1 - overlap))
         
-        # Pass config.num_epochs explicitly
-        trained_model = train_model_vit(
-            model_vit,
-            train_loader,
-            val_loader,
-            test_loader,
-            num_epochs=num_epochs,
-            lr=config.lr,
-            max_patience=patience,
-            device='cuda'
+        # Patch Embedding layer
+        self.patch_embed = nn.Linear(patch_size, dim)
+
+        # Positional Encoding
+        max_patches = (input_size - patch_size) // self.stride + 1  # Dynamically calculated max patches
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_patches, dim))
+
+        # Transformer blocks
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout), depth
         )
 
+        # MLP Head
+        self.fc = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
 
-# Start sweep
-sweep_id = wandb.sweep(sweep_config, project="spectra-classification-vit")
-wandb.agent(sweep_id, function=sweep_train, count=50)
+    def forward(self, x):
+        batch_size, channels, seq_len = x.shape
+        x = x.squeeze(1) if channels == 1 else x  # Remove channel dimension if it's 1
+
+        # Calculate the number of patches with overlap and extract overlapping patches
+        num_patches = (seq_len - self.patch_size) // self.stride + 1
+        patches = [x[:, i * self.stride : i * self.stride + self.patch_size]
+            for i in range(num_patches)]
+        x = torch.stack(patches, dim=1)  # Shape: (batch_size, num_patches, patch_size)
+
+        # Embed patches and add positional encoding
+        x = self.patch_embed(x) + self.pos_embedding[:, :num_patches, :]
+
+        # Transformer forward pass
+        x = self.transformer(x)
+
+        # Classify based on the first token representation
+        x = self.fc(x[:, 0])
+
+        return x
+
+# Define the hyperparameters
+num_classes = 4
+patch_size = 256
+dim = 256
+depth = 20
+heads = 8
+mlp_dim = 256
+dropout = 0.1
+lr = 0.0000003
+patience = 100
+num_epochs = 1000
+
+
+# Define the config dictionary object
+config = {"num_classes": num_classes, "patch_size": patch_size, "dim": dim, "depth": depth, "heads": heads, "mlp_dim": mlp_dim, 
+          "dropout": dropout, "batch_size": batch_size, "lr": lr, "patience": patience}
+
+# Initialize WandB project
+wandb.init(project="spectra-classification-vit", entity="joaoc-university-of-southampton", config=config, mode="offline")
+# Initialize and train the model
+model_vit = VisionTransformer1D(num_classes=num_classes, patch_size=patch_size, dim=dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout)
+trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader, num_epochs=num_epochs, lr=lr, max_patience=patience)
+
+# Save the model and finish WandB session
+wandb.finish()
+
+# Define the hyperparameters
+num_classes = 4
+patch_size = 2748
+dim = 256
+depth = 20
+heads = 8
+mlp_dim = 256
+dropout = 0.1
+lr = 0.0000003
+patience = 100
+num_epochs = 1000
+
+
+# Define the config dictionary object
+config = {"num_classes": num_classes, "patch_size": patch_size, "dim": dim, "depth": depth, "heads": heads, "mlp_dim": mlp_dim, 
+          "dropout": dropout, "batch_size": batch_size, "lr": lr, "patience": patience}
+
+# Initialize WandB project
+wandb.init(project="spectra-classification-vit", entity="joaoc-university-of-southampton", config=config, mode="offline")
+# Initialize and train the model
+model_vit = VisionTransformer1D(num_classes=num_classes, patch_size=patch_size, dim=dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout)
+trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader, num_epochs=num_epochs, lr=lr, max_patience=patience)
+
+# Save the model and finish WandB session
+wandb.finish()

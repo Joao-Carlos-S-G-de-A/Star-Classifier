@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --partition=gpu
 #SBATCH --ntasks=1
-#SBATCH --time=1:00:00
+#SBATCH --time=10:00:00
 #SBATCH --job-name=Transformer_LAMOST
 #SBATCH --output=output.out
 #SBATCH --error=error.err
@@ -35,5 +35,5 @@ wandb offline
 echo "Loaded Modules:"
 module list
 
-srun python Transformer_LAMOST_for_iridis.py
+srun python Transformer_LAMOST_for_iridis_trial.py
 
