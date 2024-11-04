@@ -128,7 +128,7 @@ class VisionTransformer1D(nn.Module):
 def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500, lr=1e-4, max_patience=20, device='cuda'):
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=int(max_patience/7), verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=int(max_patience/5), verbose=True)
     criterion = nn.CrossEntropyLoss()
     best_test_loss = float('inf')
     patience = max_patience
@@ -159,8 +159,21 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
                 val_loss += loss.item() * X_val.size(0)
                 val_accuracy += (outputs.argmax(dim=1) == y_val).float().mean().item()
         
+        # Test phase
+        test_loss, test_accuracy = 0.0, 0.0
+        y_true, y_pred = [], []
+        with torch.no_grad():
+            for X_test, y_test in test_loader:
+                X_test, y_test = X_test.to(device), y_test.to(device)
+                outputs = model(X_test)
+                loss = criterion(outputs, y_test)
+                test_loss += loss.item() * X_test.size(0)
+                test_accuracy += (outputs.argmax(dim=1) == y_test).float().mean().item()
+                y_true.extend(y_test.cpu().numpy())
+                y_pred.extend(outputs.argmax(dim=1).cpu().numpy())
+        
         # Scheduler step
-        scheduler.step(val_loss / len(val_loader.dataset))
+        scheduler.step(test_loss / len(test_loader.dataset))
 
         # Log metrics to WandB
         wandb.log({
@@ -173,8 +186,8 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
         })
         
         # Early stopping
-        if val_loss < best_test_loss:
-            best_test_loss = val_loss
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
             patience = max_patience
         else:
             patience -= 1
@@ -185,10 +198,10 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
     return model
 
 # Set fixed hyperparameters
-batch_size = 128
+batch_size = 512
 num_classes = 4
 patience = 50
-num_epochs = 1000
+num_epochs = 2000
 
 
 
@@ -233,26 +246,33 @@ if __name__ == "__main__":
                                                     torch.tensor(y_test, dtype=torch.long)), batch_size=batch_size, shuffle=False)
 
 
+# Generate random hyperparameters for the VisionTransformer1D model
+def random_hyperparams(patch_size_list, dim_list, depth_list, heads_list, mlp_dim_list, dropout_list, lr_list):
+    patch_size = np.random.choice(patch_size_list)
+    dim = np.random.choice(dim_list)
+    depth = np.random.choice(depth_list)
+    heads = np.random.choice(heads_list)
+    mlp_dim = np.random.choice(mlp_dim_list)
+    dropout = np.random.choice(dropout_list)
+    lr = np.random.choice(lr_list)
+    hyperparams = {"patch_size": patch_size, "dim": dim, "depth": depth, "heads": heads, "mlp_dim": mlp_dim, "dropout": dropout, "lr": lr}
+    return hyperparams
+
 # Hyperparameter tuning loop
-hyperparams_list = [
-    {"patch_size": 3748, "dim": 32, "depth": 6, "heads": 8, "mlp_dim": 256, "dropout": 0.1, "lr": 3e-2, "num_epochs": num_epochs},
-    {"patch_size": 3748, "dim": 256, "depth": 2, "heads": 4, "mlp_dim": 16, "dropout": 0.2, "lr": 1e-3, "num_epochs": num_epochs},
-    {"patch_size": 3748, "dim": 64, "depth": 4, "heads": 16, "mlp_dim": 128, "dropout": 0.3, "lr": 1e-2, "num_epochs": num_epochs},
-    {"patch_size": 3748, "dim": 128, "depth": 8, "heads": 8, "mlp_dim": 64, "dropout": 0.4, "lr": 1e-4, "num_epochs": num_epochs},
-    {"patch_size": 3748, "dim": 32, "depth": 50, "heads": 4, "mlp_dim": 128, "dropout": 0.1, "lr": 3e-2, "num_epochs": num_epochs},
-    {"patch_size": 3748, "dim": 8, "depth": 10, "heads": 16, "mlp_dim": 64, "dropout": 0.2, "lr": 1e-3, "num_epochs": num_epochs},
-    # Add more configurations as needed
-]
+hyperparams_list = [random_hyperparams(patch_size_list=[25, 250, 3748], dim_list=[32, 128, 512], 
+                                       depth_list=[4, 12, 50], heads_list=[2, 8, 32], mlp_dim_list=[64, 128, 256, 512], 
+                                       dropout_list=[0.2, 0.4], lr_list=[1e-4, 1e-3]) for _ in range(500)]
+
 
 for i, hparams in enumerate(hyperparams_list):
     config = {"patch_size": hparams["patch_size"], "dim": hparams["dim"], "depth": hparams["depth"],
               "heads": hparams["heads"], "mlp_dim": hparams["mlp_dim"], "dropout": hparams["dropout"],
-              "batch_size": batch_size, "lr": hparams["lr"], "num_epochs": hparams["num_epochs"], "patience": patience}
+              "batch_size": batch_size, "lr": hparams["lr"], "num_epochs": num_epochs, "patience": patience}
     
     wandb.init(project="spectra-classification-vit", entity="joaoc-university-of-southampton", config=config, mode="offline")
     
     model_vit = VisionTransformer1D(num_classes=num_classes, patch_size=hparams["patch_size"], dim=hparams["dim"],
                                     depth=hparams["depth"], heads=hparams["heads"], mlp_dim=hparams["mlp_dim"], dropout=hparams["dropout"])
-    trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader, num_epochs=hparams["num_epochs"], lr=hparams["lr"], max_patience=patience)
+    trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader, num_epochs=num_epochs, lr=hparams["lr"], max_patience=patience)
     
     wandb.finish()

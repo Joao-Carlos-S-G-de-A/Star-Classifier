@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --partition=gpu
 #SBATCH --ntasks=1
-#SBATCH --time=10:00:00
+#SBATCH --time=2-12:00:00
 #SBATCH --job-name=Transformer_LAMOST
 #SBATCH --output=output.out
 #SBATCH --error=error.err
