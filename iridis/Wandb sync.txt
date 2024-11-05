@@ -1,0 +1,5 @@
+find ~/.local/bin -name wandb
+export PATH=$PATH:~/.local/bin
+source ~/.bashrc  # or source ~/.zshrc
+
+

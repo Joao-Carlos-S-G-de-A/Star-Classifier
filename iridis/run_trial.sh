@@ -5,7 +5,7 @@
 #SBATCH --partition=gpu
 #SBATCH --ntasks=1
 #SBATCH --time=2-12:00:00
-#SBATCH --job-name=Transformer_LAMOST
+#SBATCH --job-name=CrossViT_Lamost
 #SBATCH --output=output.out
 #SBATCH --error=error.err
 #SBATCH --mail-type=END
@@ -13,7 +13,7 @@
 
 
 module load python/3.11
-pip install --user torch scikit-learn numpy pandas
+pip install --user torch scikit-learn numpy pandas timm
 pip install --no-index wandb
 # Check if other necessary modules are available, or else use Python's pip installation
 module load torch  # Check if PyTorch is available as a module
@@ -21,6 +21,7 @@ module load numpy  # Check if NumPy is available as a module
 module load pandas  # Check if Pandas is available as a module
 module load sklearn  # Check if scikit-learn is available as a module
 module load wandb  # Load wandb if available
+module load timm  # Load PyTorch Image Models if available
 
 
 
@@ -35,5 +36,5 @@ wandb offline
 echo "Loaded Modules:"
 module list
 
-srun python Transformer_LAMOST_for_iridis_trial.py
+srun python CrossViT_Lamost.py
 
