@@ -8,8 +8,8 @@ import pandas as pd
 import wandb
 import gc
 from sklearn.model_selection import train_test_split
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from timm.models.registry import register_model
+from timm.layers import DropPath, to_2tuple, trunc_normal_
+from timm.models import register_model
 from timm.models.vision_transformer import _cfg, Mlp, Block
 
 # Create a custom Vision Transformer model
@@ -121,7 +121,7 @@ class CrossAttentionBlock(nn.Module):
         return x
 
 class VisionTransformer1D(nn.Module):
-    def __init__(self, input_size=3748, num_classes=4, patch_sizes=[20, 40], overlap=0.5, dim=128, depth=6, heads=8, mlp_dim=256, dropout=0.2):
+    def __init__(self, input_size=3748, num_classes=4, patch_sizes=[20, 40], overlap=0, dim=128, depth=6, heads=8, mlp_dim=256, dropout=0.2):
         super(VisionTransformer1D, self).__init__()
         self.num_branches = len(patch_sizes)
         self.dim = dim
@@ -257,7 +257,7 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
     return model
 
 # Set fixed hyperparameters
-batch_size = 128
+batch_size = 16
 num_classes = 4
 patience = 30
 num_epochs = 500
@@ -316,9 +316,9 @@ def random_hyperparams(patch_size_list, dim_list, depth_list, heads_list, mlp_di
     return hyperparams
 
 # Hyperparameter tuning loop
-hyperparams_list = [random_hyperparams(patch_size_list=[1, 250, 3748], dim_list=[32, 128, 512], 
-                                       depth_list=[4, 12, 50], heads_list=[2, 8, 32], mlp_dim_list=[64, 128, 256, 512], 
-                                       dropout_list=[0.1, 0.4], lr_list=[1e-4, 1e-3]) for _ in range(30)]
+hyperparams_list = [random_hyperparams(patch_size_list=[1, 3748], dim_list=[32, 128], 
+                                       depth_list=[4, 12], heads_list=[2, 8], mlp_dim_list=[64, 128, 256], 
+                                       dropout_list=[0.1, 0.4], lr_list=[1e-4, 1e-3]) for _ in range(500)]
 
 
 for i, hparams in enumerate(hyperparams_list):
@@ -328,7 +328,7 @@ for i, hparams in enumerate(hyperparams_list):
     
     wandb.init(project="LAMOST-crossvit", entity="joaoc-university-of-southampton", config=config, mode="offline")
     
-    model_vit = VisionTransformer1D(num_classes=num_classes, patch_size=hparams["patch_size"], dim=hparams["dim"],
+    model_vit = VisionTransformer1D(num_classes=num_classes, patch_sizes=hparams["patch_size"], dim=hparams["dim"],
                                     depth=hparams["depth"], heads=hparams["heads"], mlp_dim=hparams["mlp_dim"], dropout=hparams["dropout"])
     trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader, num_epochs=num_epochs, lr=hparams["lr"], max_patience=patience)
     

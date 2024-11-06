@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --mem=32000
-#SBATCH --gres=gpu:2
-#SBATCH --partition=gpu
+#SBATCH --gres=gpu:4
+#SBATCH --partition=1080ti
 #SBATCH --ntasks=1
 #SBATCH --time=1:00:00
 #SBATCH --job-name=Transformer_LAMOST
@@ -37,3 +37,32 @@ module list
 
 srun python Transformer_LAMOST_for_iridis.py
 
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --mem=32000
+#SBATCH --gres=gpu:2
+#SBATCH --partition=gpu
+#SBATCH --ntasks=1
+#SBATCH --time=12:00:00
+#SBATCH --job-name=CrossViT_Lamostt2
+#SBATCH --output=output.out
+#SBATCH --error=error.err
+#SBATCH --mail-type=END
+#SBATCH --mail-user=jsga1n21@soton.ac.uk
+
+module load python/3.11
+
+# Install necessary packages
+pip install --user torch scikit-learn numpy pandas 
+pip install --no-index wandb timm
+
+# Uncomment the line below and comment out "wandb offline" if running on Cedar
+wandb login 5ffa81406d14f2e8c23a8ec1a882e0b245008ff8
+wandb offline
+
+# Confirming loaded modules in the job log
+echo "Loaded Modules:"
+module list
+
+# Run your script
+srun python CrossVit_Lamost.py
