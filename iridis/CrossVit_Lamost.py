@@ -257,7 +257,7 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
     return model
 
 # Set fixed hyperparameters
-batch_size = 16
+batch_size = 8
 num_classes = 4
 patience = 30
 num_epochs = 500
@@ -316,9 +316,9 @@ def random_hyperparams(patch_size_list, dim_list, depth_list, heads_list, mlp_di
     return hyperparams
 
 # Hyperparameter tuning loop
-hyperparams_list = [random_hyperparams(patch_size_list=[1, 3748], dim_list=[32, 128], 
-                                       depth_list=[4, 12], heads_list=[2, 8], mlp_dim_list=[64, 128, 256], 
-                                       dropout_list=[0.1, 0.4], lr_list=[1e-4, 1e-3]) for _ in range(500)]
+hyperparams_list = [random_hyperparams(patch_size_list=[1, 3748], dim_list=[128, 256], 
+                                       depth_list=[4, 12], heads_list=[2, 8], mlp_dim_list=[128, 512], 
+                                       dropout_list=[0.1, 0.4], lr_list=[1e-3]) for _ in range(500)]
 
 
 for i, hparams in enumerate(hyperparams_list):

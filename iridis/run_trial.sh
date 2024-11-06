@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --partition=gpu
 #SBATCH --ntasks=2
-#SBATCH --time=12:00:00
+#SBATCH --time=1-12:00:00
 #SBATCH --job-name=CrossViT_Lamost
 #SBATCH --output=output.out
 #SBATCH --error=error.err
