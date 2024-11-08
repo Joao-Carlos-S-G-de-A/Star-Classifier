@@ -4,8 +4,8 @@
 #SBATCH --gres=gpu:2
 #SBATCH --partition=gpu
 #SBATCH --ntasks=2
-#SBATCH --time=1-12:00:00
-#SBATCH --job-name=CrossViT_Lamost
+#SBATCH --time=6:00:00
+#SBATCH --job-name=CrossViT_Lamost_rope
 #SBATCH --output=output.out
 #SBATCH --error=error.err
 #SBATCH --mail-type=END
@@ -26,4 +26,4 @@ echo "Loaded Modules:"
 module list
 
 # Run your script
-srun python CrossVit_Lamost.py
+srun python CrossVit_Lamost_rope.py

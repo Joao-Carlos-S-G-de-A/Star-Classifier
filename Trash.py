@@ -4166,3 +4166,177 @@ trained_model = train_model_vit(model_vit, train_loader, val_loader, test_loader
 
 # Save the model and finish WandB session
 wandb.finish()
+
+def init_rope_frequencies(dim: int, num_heads: int, theta: float = 10.0, rotate: bool = True):
+    mag = 1 / (theta ** (torch.arange(0, dim // 2, 2).float() / dim))
+    angles = torch.rand(num_heads, 1) * 2 * torch.pi if rotate else torch.zeros(num_heads, 1)
+    freq_x = mag * torch.cat([torch.cos(angles), torch.cos(torch.pi/2 + angles)], dim=-1)
+    freq_y = mag * torch.cat([torch.sin(angles), torch.sin(torch.pi/2 + angles)], dim=-1)
+    return torch.stack([freq_x, freq_y], dim=0)
+
+def apply_rotary_position_embeddings(freqs, q, k):
+    cos, sin = freqs[0], freqs[1]
+    q_rot = (q * cos) + (torch.roll(q, shifts=1, dims=-1) * sin)
+    k_rot = (k * cos) + (torch.roll(k, shifts=1, dims=-1) * sin)
+    return q_rot, k_rot 
+
+class VisionTransformer1D(nn.Module):
+    def __init__(self, input_size, num_classes=4, patch_sizes=[20, 40], overlap=0, dim=128, depth=6, heads=8, mlp_dim=256, dropout=0.2, theta=10.0):
+        super(VisionTransformer1D, self).__init__()
+        self.num_branches = len(patch_sizes)
+        self.dim = dim
+        self.overlap = overlap
+        self.branches = nn.ModuleList()
+        
+        # Set up branches for different patch sizes
+        for patch_size in patch_sizes:
+            stride = int(patch_size * (1 - overlap))
+            patch_embed = nn.Linear(patch_size, dim)
+            transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout), depth
+            )
+            self.branches.append(nn.ModuleDict({
+                'patch_embed': patch_embed,
+                'transformer': transformer
+            }))
+        
+        # Cross-Attention with RoPE for fusion
+        self.cross_attention = CrossAttentionBlock(dim, heads, theta=theta)
+        
+        # Classification head
+        self.fc = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+
+    def forward(self, x):
+        batch_size, seq_len = x.shape
+        branch_outputs = []
+        
+        for branch in self.branches:
+            patch_size = branch['patch_embed'].in_features
+            stride = int(patch_size * (1 - self.overlap))
+            num_patches = (seq_len - patch_size) // stride + 1
+            patches = [x[:, i * stride : i * stride + patch_size] for i in range(num_patches)]
+            x_branch = torch.stack(patches, dim=1)
+            x_branch = branch['patch_embed'](x_branch)
+            x_branch = branch['transformer'](x_branch)
+            branch_outputs.append(x_branch)
+
+        x_fused = torch.cat(branch_outputs, dim=1)
+        x_fused = self.cross_attention(x_fused)
+        x = self.fc(x_fused[:, 0])
+        return x
+    
+    class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.wq = nn.Linear(dim, dim, bias=qkv_bias)
+        self.wk = nn.Linear(dim, dim, bias=qkv_bias)
+        self.wv = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+
+        B, N, C = x.shape
+        q = self.wq(x[:, 0:1, ...]).reshape(B, 1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)  # B1C -> B1H(C/H) -> BH1(C/H)
+        k = self.wk(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)  # BNC -> BNH(C/H) -> BHN(C/H)
+        v = self.wv(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)  # BNC -> BNH(C/H) -> BHN(C/H)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # BH1(C/H) @ BH(C/H)N -> BH1N
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, 1, C)   # (BH1N @ BHN(C/H)) -> BH1(C/H) -> B1H(C/H) -> B1C
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, has_mlp=True):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = CrossAttention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.has_mlp = has_mlp
+        if has_mlp:
+            self.norm2 = norm_layer(dim)
+            mlp_hidden_dim = int(dim * mlp_ratio)
+            self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x[:, 0:1, ...] + self.drop_path(self.attn(self.norm1(x)))
+        if self.has_mlp:
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+
+
+
+class VisionTransformer1D(nn.Module):
+    def __init__(self, input_size, num_classes=4, patch_sizes=[20, 40], overlap=0.5, dim=128, depth=6, heads=8, mlp_dim=256, dropout=0.2):
+        super(VisionTransformer1D, self).__init__()
+        if type(patch_sizes) is int:
+            patch_sizes = [patch_sizes]
+        self.num_branches = len(patch_sizes)
+        self.dim = dim
+        self.overlap = overlap
+        self.branches = nn.ModuleList()
+        
+        # Set up branches for different patch sizes
+        for patch_size in patch_sizes:
+            stride = int(patch_size * (1 - overlap))
+            max_patches = (input_size - patch_size) // stride + 1
+            max_patches = (input_size // patch_size) ** 2
+            patch_embed = nn.Linear(patch_size, dim)
+            pos_embedding = nn.Embedding(max_patches + 1, dim)  # Changed to nn.Embedding to act as a module
+            transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout), depth
+            )
+            self.branches.append(nn.ModuleDict({
+                'patch_embed': patch_embed,
+                'pos_embedding': pos_embedding,
+                'transformer': transformer
+            }))
+        
+        # Cross-Attention for fusion of multiple patch sizes
+        self.cross_attention = CrossAttentionBlock(dim, heads)
+        
+        # Classification head
+        self.fc = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+
+    def forward(self, x):
+        batch_size, seq_len = x.shape
+        branch_outputs = []
+        
+        # Extract patches, embed, and process with transformer for each branch
+        for branch in self.branches:
+            patch_size = branch['patch_embed'].in_features
+            stride = int(patch_size * (1 - self.overlap))
+            num_patches = (seq_len - patch_size) // stride + 1
+            patches = [x[:, i * stride : i * stride + patch_size] for i in range(num_patches)]
+            x_branch = torch.stack(patches, dim=1)
+            x_branch = branch['patch_embed'](x_branch) + branch['pos_embedding'](torch.arange(num_patches, device=x.device)).unsqueeze(0)
+            x_branch = branch['transformer'](x_branch)
+            branch_outputs.append(x_branch)
+
+        # Apply cross-attention to combine the representations from each branch
+        x_fused = torch.cat(branch_outputs, dim=1)
+        x_fused = self.cross_attention(x_fused)
+
+        # Classification based on the first token representation
+        x = self.fc(x_fused[:, 0])
+        return x
