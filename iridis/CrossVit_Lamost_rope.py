@@ -8,8 +8,8 @@ import pandas as pd
 import wandb
 import gc
 from sklearn.model_selection import train_test_split
-from timm.models.vision_transformer import  Mlp
-from timm.layers import DropPath
+from timm.layers import DropPath, to_2tuple, trunc_normal_
+from timm.models.vision_transformer import _cfg, Mlp, Block
 
 # Create a custom Vision Transformer model
 # Create dataset classes (using your BalancedDataset approach) and training function
@@ -71,9 +71,9 @@ class BalancedValidationDataset(Dataset):
 def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500, lr=1e-4, max_patience=20, device='cuda'):
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=int(max_patience/5))
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=int(max_patience/5), verbose=True)
     criterion = nn.CrossEntropyLoss()
-    best_test_loss = float('inf')
+    best_val_loss = float('inf')
     patience = max_patience
     
     for epoch in range(num_epochs):
@@ -116,7 +116,7 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
                 y_pred.extend(outputs.argmax(dim=1).cpu().numpy())
         
         # Scheduler step
-        scheduler.step(test_loss / len(test_loader.dataset))
+        scheduler.step(val_loss / len(val_loader.dataset))
 
         # Log metrics to WandB
         wandb.log({
@@ -125,8 +125,7 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
             "val_loss": val_loss / len(val_loader.dataset),
             "train_accuracy": train_accuracy / len(train_loader),
             "val_accuracy": val_accuracy / len(val_loader),
-            "learning_rate": scheduler.get_last_lr(),
-            #"learning_rate": optimizer.param_groups[0]['lr'],
+            "learning_rate": optimizer.param_groups[0]['lr'],
             "test_loss": test_loss / len(test_loader.dataset),
             "test_accuracy": test_accuracy / len(test_loader),
             "confusion_matrix": wandb.plot.confusion_matrix(probs=None,
@@ -135,8 +134,8 @@ def train_model_vit(model, train_loader, val_loader, test_loader, num_epochs=500
         })
         
         # Early stopping
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience = max_patience
         else:
             patience -= 1
@@ -229,7 +228,7 @@ class CrossAttentionBlock(nn.Module):
         return x
 
 class VisionTransformer1D(nn.Module):
-    def __init__(self, input_size, num_classes=4, patch_sizes=[20, 40], overlap=0, dim=128, depth=6, heads=8, mlp_dim=256, dropout=0.2, theta = 10.0):
+    def __init__(self, input_size, num_classes=4, patch_sizes=[20, 40], overlap=0.5, dim=128, depth=6, heads=8, mlp_dim=256, dropout=0.2, theta = 10.0):
         super(VisionTransformer1D, self).__init__()
         if isinstance(patch_sizes, int):
             patch_sizes = [patch_sizes]
@@ -240,12 +239,17 @@ class VisionTransformer1D(nn.Module):
         
         # Set up branches for different patch sizes
         for patch_size in patch_sizes:
+            stride = int(patch_size * (1 - overlap))
+            max_patches = (input_size - patch_size) // stride + 1
+            max_patches = (input_size // patch_size) ** 2
             patch_embed = nn.Linear(patch_size, dim)
+            #pos_embedding = nn.Embedding(max_patches + 1, dim)  # "+ 1" to account for class token
             transformer = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout, batch_first=True), depth
+                nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout), depth
             )
             self.branches.append(nn.ModuleDict({
                 'patch_embed': patch_embed,
+                #'pos_embedding': pos_embedding,
                 'transformer': transformer
             }))
 
@@ -290,7 +294,8 @@ class VisionTransformer1D(nn.Module):
         # Classification based on the class token representation
         x = self.fc(x_fused[:, 0])  # Use the class token at position 0 for classification
         return x
-    
+
+# Rotational Positional Encoding
 class Rotary(torch.nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -328,7 +333,7 @@ class CrossAttention(nn.Module):
         self.theta = theta
 
         self.wq = nn.Linear(dim, dim, bias=qkv_bias)
-        self.wk = nn.Linear(dim, dim, bias=qkv_bias)
+        self.wk = nn.Linear(dim, dim, bias=qkv_bias) 
         self.wv = nn.Linear(dim, dim, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -356,10 +361,11 @@ class CrossAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 # Set fixed hyperparameters
-batch_size = 32
+batch_size = 8
 num_classes = 4
-patience = 30
+patience = 40
 num_epochs = 500
 
 # Example usage
@@ -417,9 +423,9 @@ def random_hyperparams(patch_size_list, dim_list, depth_list, heads_list, mlp_di
 
 
 # Hyperparameter tuning loop
-hyperparams_list = [random_hyperparams(patch_size_list=[1, 25, 3748], dim_list=[16, 64], 
-                                       depth_list=[2, 8], heads_list=[2, 8], mlp_dim_list=[64, 256], 
-                                       dropout_list=[0.1, 0.4], lr_list=[1e-3, 1e-5], theta=[10000.0, 100.0, 1.0]) for _ in range(64)]
+hyperparams_list = [random_hyperparams(patch_size_list=[1, 3748], dim_list=[128, 256], 
+                                       depth_list=[6], heads_list=[4, 16], mlp_dim_list=[512, 1024], 
+                                       dropout_list=[0.1, 0.4], lr_list=[1e-3, 1e-5], theta=[30000.0, 10000.0], num_patch_sizes=1) for _ in range(32)]
 
 
 for i, hparams in enumerate(hyperparams_list):

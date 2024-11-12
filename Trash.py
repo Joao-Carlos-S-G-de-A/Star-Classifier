@@ -4340,3 +4340,170 @@ class VisionTransformer1D(nn.Module):
         # Classification based on the first token representation
         x = self.fc(x_fused[:, 0])
         return x
+    
+
+            # Extract patches, embed, and process with transformer for each branch
+        for branch in self.branches:
+            patch_size = branch['patch_embed'].in_features
+            stride = int(patch_size)
+            num_patches = (seq_len - patch_size) // stride + 1
+            patches = [x[:, i * stride : i * stride + patch_size] for i in range(num_patches)]
+            x_branch = torch.stack(patches, dim=1)
+            x_branch = branch['patch_embed'](x_branch) + branch['pos_embedding'].to(x.device)  # Add positional encoding
+            x_branch = branch['transformer'](x_branch)
+            branch_outputs.append(x_branch)
+        def forward(self, x):
+
+
+# Based on SpectraFM: Tuning into Stellar Foundation Models
+import torch
+import torch.nn as nn
+
+class VisionTransformer1D(nn.Module):
+    def __init__(self, input_size, num_classes, patch_sizes, dim, depth, heads, mlp_dim, dropout, lambda_min=4000, lambda_max=7000):
+        super(VisionTransformer1D, self).__init__()
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+        self.branches = nn.ModuleList()
+
+        for patch_size in patch_sizes:
+            stride = patch_size
+            max_patches = (input_size - patch_size) // stride + 1
+            print("max_patches", max_patches)
+            patch_embed = nn.Linear(patch_size, dim)
+            pos_embedding = nn.Parameter(self.create_positional_encoding(max_patches, dim), requires_grad=False)  # Not in ModuleDict
+            transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout), depth
+            )
+            
+            # Store branch elements directly as attributes
+            branch = nn.ModuleDict({
+                'patch_embed': patch_embed,
+                'transformer': transformer
+            })
+            branch.pos_embedding = pos_embedding  # Assign pos_embedding as an attribute
+            self.branches.append(branch)
+
+        # Cross-Attention for fusion of multiple patch sizes
+        self.cross_attention = CrossAttentionBlock(dim, heads)
+
+    def create_positional_encoding(self, num_patches, d_model):
+        pos_encoding = torch.zeros((num_patches, d_model))
+        for pos in range(num_patches):
+            lambda_norm = (pos - self.lambda_min) / (self.lambda_max - self.lambda_min)
+            for k in range(d_model):
+                angle = torch.tensor(1000 * lambda_norm / (10000 ** (k / d_model)))
+                if k % 2 == 0:
+                    pos_encoding[pos, k] = torch.sin(angle)
+                else:
+                    pos_encoding[pos, k] = torch.cos(angle)
+        return pos_encoding
+
+
+
+    def forward(self, x):
+        batch_size, channels, seq_len = x.shape  # Assuming x has 3 dimensions
+        x = x.squeeze(1) if channels == 1 else x  # Remove channel dimension if it's 1
+        branch_outputs = []
+
+        print("branch.self", self.branches)
+
+        for branch in self.branches:
+            patch_embed = branch['patch_embed']
+            transformer = branch['transformer']
+            pos_embedding = branch.pos_embedding  # Access `pos_embedding` directly
+
+            # Create patches for each branch
+            print(seq_len)
+            stride = patch_embed.weight.shape[1]  # Adjust based on patch size
+            print("patch_embed.weight.shape[1]", patch_embed.weight.shape[1])
+            print("stride", stride)
+            print("self.lambda_min", self.lambda_min)
+            print(stride)
+            num_patches = seq_len // stride
+            print(num_patches)
+            patches = [x[:, i * stride : i * stride + patch_embed.weight.shape[1]] for i in range(num_patches)]
+            x_branch = torch.stack(patches, dim=1)
+
+            # Apply patch embedding and add positional encoding
+            x_branch = patch_embed(x_branch) + pos_embedding.to(x.device)  # Use direct attribute access
+            x_branch = transformer(x_branch)
+            branch_outputs.append(x_branch)
+
+            # Apply cross-attention to combine the representations from each branch
+            x_fused = torch.cat(branch_outputs, dim=1)
+            x_fused = self.cross_attention(x_fused)
+
+            # Classification based on the first token representation
+            x = self.fc(x_fused[:, 0])
+            return x
+class VisionTransformer1D(nn.Module):
+    def __init__(self, input_size, num_classes, patch_sizes, dim, depth, heads, mlp_dim, dropout, lambda_min=4000, lambda_max=7000):
+        super(VisionTransformer1D, self).__init__()
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+        self.branches = nn.ModuleList()
+        self.class_token = nn.Parameter(torch.zeros(1, 1, dim))  # Initialize class token
+
+        for patch_size in patch_sizes:
+            stride = patch_size
+            max_patches = (input_size - patch_size) // stride + 1
+            print("max_patches", max_patches)
+            patch_embed = nn.Linear(patch_size, dim)
+            pos_embedding = nn.Parameter(self.create_positional_encoding(max_patches, dim), requires_grad=False)  # Not in ModuleDict
+            transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(dim, heads, mlp_dim, dropout), depth
+            )
+            
+            # Store branch elements directly as attributes
+            branch = nn.ModuleDict({
+                'patch_embed': patch_embed,
+                'transformer': transformer
+            })
+            branch.pos_embedding = pos_embedding  # Assign pos_embedding as an attribute
+            self.branches.append(branch)
+
+        # Cross-Attention for fusion of multiple patch sizes
+        self.cross_attention = CrossAttentionBlock(dim, heads)
+
+    def create_positional_encoding(self, num_patches, d_model):
+        pos_encoding = torch.zeros((num_patches, d_model))
+        for pos in range(num_patches):
+            lambda_norm = (pos - self.lambda_min) / (self.lambda_max - self.lambda_min)
+            for k in range(d_model):
+                angle = torch.tensor(1000 * lambda_norm / (10000 ** (k / d_model)))
+                if k % 2 == 0:
+                    pos_encoding[pos, k] = torch.sin(angle)
+                else:
+                    pos_encoding[pos, k] = torch.cos(angle)
+        return pos_encoding
+
+    def forward(self, x):
+        batch_size, channels, seq_len = x.shape  # Assuming x has 3 dimensions
+        x = x.squeeze(1) if channels == 1 else x  # Remove channel dimension if it's 1
+        branch_outputs = []
+
+        for branch in self.branches:
+            patch_embed = branch['patch_embed']
+            transformer = branch['transformer']
+            pos_embedding = branch.pos_embedding  # Access `pos_embedding` directly
+
+            # Create patches for each branch
+            stride = patch_embed.weight.shape[1]  # Adjust based on patch size
+            num_patches = seq_len // stride
+            patches = [x[:, i * stride : i * stride + patch_embed.weight.shape[1]] for i in range(num_patches)]
+            x_branch = torch.stack(patches, dim=1)
+
+            # Apply patch embedding and add positional encoding
+            x_branch = patch_embed(x_branch) + pos_embedding.to(x.device)  # Use direct attribute access
+            x_branch = transformer(x_branch)
+            branch_outputs.append(x_branch)
+
+        # Concatenate branch outputs and add class token
+        x = torch.cat(branch_outputs, dim=1)
+        class_token = self.class_token.expand(batch_size, -1, -1)
+        x = torch.cat((class_token, x), dim=1)
+
+        # Apply cross-attention
+        x = self.cross_attention(x)
+        return x

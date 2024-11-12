@@ -4,8 +4,8 @@
 #SBATCH --gres=gpu:2
 #SBATCH --partition=gpu
 #SBATCH --ntasks=2
-#SBATCH --time=6:00:00
-#SBATCH --job-name=CrossViT_Lamost_rope
+#SBATCH --time=12:00:00
+#SBATCH --job-name=testpatch13748
 #SBATCH --output=output.out
 #SBATCH --error=error.err
 #SBATCH --mail-type=END
