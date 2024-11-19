@@ -4507,3 +4507,164 @@ class VisionTransformer1D(nn.Module):
         # Apply cross-attention
         x = self.cross_attention(x)
         return x
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., theta):
+        super().__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        self.scale = qk_scale or (dim // num_heads) ** -0.5
+        self.theta = theta
+
+        self.wq = nn.Linear(dim, dim, bias=qkv_bias)
+        self.wk = nn.Linear(dim, dim, bias=qkv_bias) 
+        self.wv = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+        # Initialize rotary positional encoding
+        self.rotary = Rotary(dim // num_heads, base=theta)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        q = self.wq(x[:, 0:1, ...]).view(B, 1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.wk(x).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        v = self.wv(x).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        # Apply rotary position embedding
+        cos, sin = self.rotary(q)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Attention calculation with rotated embeddings
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, 1, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+    
+import torch
+import matplotlib.pyplot as plt
+
+# Define the Rotary class
+class Rotary(torch.nn.Module):
+    def __init__(self, dim, base):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x, seq_dim=1):
+        seq_len = x.shape[seq_dim]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            self.cos_cached = emb.cos()[None, :, None, :]
+            self.sin_cached = emb.sin()[None, :, None, :]
+        return self.cos_cached, self.sin_cached
+
+# Initialize the Rotary positional embedding
+dim = 16
+base = 30
+rotary_pos_emb = Rotary(dim=dim, base=base)
+
+# Create a dummy input tensor
+seq_len = 50
+batch_size = 1
+x = torch.zeros((batch_size, seq_len, dim))
+
+# Get the cos and sin embeddings
+cos_emb, sin_emb = rotary_pos_emb(x)
+
+# Plot the angles for the first dimension of the positional embeddings
+plt.figure(figsize=(12, 6))
+plt.plot(cos_emb[0, :, 0, 0].cpu().numpy(), label='cos')
+plt.plot(sin_emb[0, :, 0, 0].cpu().numpy(), label='sin')
+plt.title('Rotary Positional Embedding Angles')
+plt.xlabel('Sequence Position')
+plt.ylabel('Angle')
+plt.legend()
+plt.show()
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+# Parameters
+base = 10000
+dim = 256
+
+# Calculate inverse frequencies
+i = np.arange(0, dim, 2)
+inv_freq = 1.0 / (base ** (i / dim))
+inv_freq = torch.tensor(inv_freq)
+
+# Generate sequence positions
+t = torch.arange(4000)
+
+# Calculate frequencies
+freqs = torch.einsum("i,j->ij", t, inv_freq)
+
+# Calculate embeddings
+emb = torch.cat((freqs, freqs), dim=-1)
+
+# Calculate cos and sin
+cos = emb.cos()
+sin = emb.sin()
+
+# Plot the angles for the first dimension
+plt.figure(figsize=(12, 6))
+plt.plot(cos[:, 1].numpy(), label='cos')
+plt.plot(sin[:, 1].numpy(), label='sin')
+plt.title('Rotary Positional Embedding Angles for Dimension 0')
+plt.xlabel('Sequence Position')
+plt.ylabel('Angle')
+plt.legend()
+plt.show()
+
+
+
+    import torch
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Function to calculate rotation angles
+def compute_rotation_angles(seq_len, dim, base=10000):
+    positions = torch.arange(seq_len).unsqueeze(1).float()  # Shape: (seq_len, 1)
+    per_dim = dim // 2
+    inv_freq = 1.0 / (base ** (torch.arange(0, per_dim).float() / per_dim))  # Shape: (dim/2,)
+    angles = positions * inv_freq  # Broadcasting: Shape (seq_len, dim/2)
+    return torch.cat((torch.sin(angles), torch.cos(angles)), dim=-1)
+
+def init_rope_frequencies(dim, num_heads, base=10000):
+    per_head_dim = dim // num_heads
+    inv_freq = 1.0 / (base ** (torch.arange(0, per_head_dim, 2).float() / per_head_dim))
+    return torch.cat((torch.cos(inv_freq), torch.sin(inv_freq)), dim=-1)
+# Example configuration
+seq_len = 3748  # Number of positions in the sequence
+dim = 1024 # Dimensionality of embedding vector
+num_heads = 1  # Number of attention heads
+theta = 10000 # Hyperparameter controlling frequency scaling
+
+# Initialize frequencies
+freqs = init_rope_frequencies(dim, num_heads, theta)
+
+# Compute rotation angles
+angles = compute_rotation_angles(seq_len, dim, base=theta)
+
+#print(angles[:10, :10])  # Print the first few rows and columns
+
+# Plot heatmap
+plt.figure(figsize=(10, 6))
+plt.imshow(angles, aspect='auto', cmap='viridis', extent=[0, seq_len, 0, dim // num_heads])
+plt.colorbar(label="Rotation Angle (radians)")
+plt.title("Rotary Position Embedding Rotation Angles")
+plt.xlabel("Sequence Position")
+plt.ylabel("Embedding Dimension (per head)")
+plt.show()
