@@ -4667,4 +4667,310 @@ plt.colorbar(label="Rotation Angle (radians)")
 plt.title("Rotary Position Embedding Rotation Angles")
 plt.xlabel("Sequence Position")
 plt.ylabel("Embedding Dimension (per head)")
-plt.show()
+plt.show()class DualMambaClassifier(nn.Module):
+    def __init__(self, gaia_dim, spectra_dim, d_model, num_classes, d_state=64, d_conv=4, n_layers=6):
+        super(DualMambaClassifier, self).__init__()
+        # MAMBA model for Gaia data
+        self.gaia_model = StarClassifierMAMBA(d_model, num_classes, d_state, d_conv, gaia_dim, n_layers)
+        # MAMBA model for spectra data
+        self.spectra_model = StarClassifierMAMBA(d_model, num_classes, d_state, d_conv, spectra_dim, n_layers)
+        # Cross attention block
+        self.gaia_model.input_projection = nn.Linear(17, d_model)  # Gaia input
+        self.spectra_model.input_projection = nn.Linear(3749, d_model)  # Spectra input
+
+        print("Shape of Gaia input projection: ", self.gaia_model.input_projection)
+        print("Shape of Spectra input projection: ", self.spectra_model.input_projection)
+        self.cross_attention = CrossAttentionBlock(dim=d_model*2, num_heads=8)
+        print("Shape of cross attention: ", self.cross_attention)
+
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, num_classes)
+        )
+
+    def forward(self, gaia_x, spectra_x):
+        gaia_features = self.gaia_model.mamba_layer(self.gaia_model.input_projection(gaia_x).unsqueeze(1))
+        spectra_features = self.spectra_model.mamba_layer(self.spectra_model.input_projection(spectra_x).unsqueeze(1))
+
+        # Cross attention: allowing information sharing between modalities
+        combined_features = torch.cat([gaia_features, spectra_features], dim=1)
+        print(f'Combined features shape: {combined_features.shape}')
+
+        fused_features = self.cross_attention(combined_features)
+        print(f'Fused features shape: {fused_features.shape}')
+
+        # Global average pooling and classification
+        pooled_features = fused_features.mean(dim=1)
+        print(f'Pooled features shape: {pooled_features.shape}')
+
+        output = self.classifier(pooled_features)
+
+        return output
+    def train_model_mamba_fusion(
+    model, train_loader, val_loader, test_loader, 
+    num_epochs=500, lr=1e-4, max_patience=20, device='cuda'
+):
+    # Move model to device
+    model = model.to(device)
+
+    # Define optimizer, scheduler, and loss function
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=int(max_patience / 3), verbose=True
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_loss = float('inf')
+    patience = max_patience
+
+    for epoch in range(num_epochs):
+        # Resample training and validation data if needed
+        train_loader.dataset.re_sample()
+        val_loader.dataset.balance_classes()
+
+        # Training phase
+        model.train()
+        train_loss, train_accuracy = 0.0, 0.0
+
+        for spectra_batch, gaia_batch, y_batch in train_loader:
+            spectra_batch, gaia_batch, y_batch = (
+                spectra_batch.to(device),
+                gaia_batch.to(device),
+                y_batch.to(device)
+            )
+            optimizer.zero_grad()
+            outputs = model(spectra_batch, gaia_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * spectra_batch.size(0)
+            train_accuracy += (outputs.argmax(dim=1) == y_batch).float().mean().item()
+
+        # Validation phase
+        model.eval()
+        val_loss, val_accuracy = 0.0, 0.0
+        with torch.no_grad():
+            for spectra_val, gaia_val, y_val in val_loader:
+                spectra_val, gaia_val, y_val = (
+                    spectra_val.to(device),
+                    gaia_val.to(device),
+                    y_val.to(device)
+                )
+                outputs = model(spectra_val, gaia_val)
+                loss = criterion(outputs, y_val)
+
+                val_loss += loss.item() * spectra_val.size(0)
+                val_accuracy += (outputs.argmax(dim=1) == y_val).float().mean().item()
+
+        # Test phase and metric collection
+        test_loss, test_accuracy = 0.0, 0.0
+        y_true, y_pred = [], []
+        with torch.no_grad():
+            for spectra_test, gaia_test, y_test in test_loader:
+                spectra_test, gaia_test, y_test = (
+                    spectra_test.to(device),
+                    gaia_test.to(device),
+                    y_test.to(device)
+                )
+                outputs = model(spectra_test, gaia_test)
+                loss = criterion(outputs, y_test)
+
+                test_loss += loss.item() * spectra_test.size(0)
+                test_accuracy += (outputs.argmax(dim=1) == y_test).float().mean().item()
+                y_true.extend(y_test.cpu().numpy())
+                y_pred.extend(outputs.argmax(dim=1).cpu().numpy())
+
+        # Update scheduler
+        scheduler.step(val_loss / len(val_loader.dataset))
+
+        # Log metrics to WandB
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss / len(train_loader.dataset),
+            "val_loss": val_loss / len(val_loader.dataset),
+            "train_accuracy": train_accuracy / len(train_loader),
+            "val_accuracy": val_accuracy / len(val_loader),
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "test_loss": test_loss / len(test_loader.dataset),
+            "test_accuracy": test_accuracy / len(test_loader),
+            "confusion_matrix": wandb.plot.confusion_matrix(
+                probs=None, y_true=y_true, preds=y_pred, class_names=np.unique(y_true)
+            ),
+            "classification_report": classification_report(
+                y_true, y_pred, target_names=[str(i) for i in range(len(np.unique(y_true)))]
+            )
+        })
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience = max_patience
+            best_model = model.state_dict()
+        else:
+            patience -= 1
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+
+    # Load the best model weights
+    model.load_state_dict(best_model)
+    return model
+class DualMambaClassifier(nn.Module):
+    def __init__(self, gaia_dim, spectra_dim, d_model, num_classes, d_state=64, d_conv=4, n_layers=6):
+        super(DualMambaClassifier, self).__init__()
+        # MAMBA model for Gaia data
+        self.gaia_model = StarClassifierMAMBA(d_model, num_classes, d_state, d_conv, gaia_dim, n_layers)
+        # MAMBA model for spectra data
+        self.spectra_model = StarClassifierMAMBA(d_model, num_classes, d_state, d_conv, spectra_dim, n_layers)
+        # Cross attention block
+        self.gaia_model.input_projection = nn.Linear(gaia_dim, d_model)  # Gaia input
+        self.spectra_model.input_projection = nn.Linear(spectra_dim, d_model)  # Spectra input
+
+        print("Shape of Gaia input projection: ", self.gaia_model.input_projection)
+        print("Shape of Spectra input projection: ", self.spectra_model.input_projection)
+        self.cross_attention = CrossAttentionBlock(dim=d_model*2, num_heads=8)
+        print("Shape of cross attention: ", self.cross_attention)
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, num_classes)
+        )
+
+    def forward(self, gaia_x, spectra_x):
+        print(f'Gaia input shape: {gaia_x.shape}')
+        print(f'Spectra input shape: {spectra_x.shape}')
+        
+        # Ensure the inputs are correctly aligned
+        if gaia_x.shape[1] != 17 or spectra_x.shape[1] != 3748:
+            raise ValueError("Input dimensions do not match the expected dimensions for Gaia and spectra data.")
+
+        gaia_features = self.gaia_model.mamba_layer(self.gaia_model.input_projection(gaia_x).unsqueeze(1))
+        spectra_features = self.spectra_model.mamba_layer(self.spectra_model.input_projection(spectra_x).unsqueeze(1))
+
+        # Cross attention: allowing information sharing between modalities
+        combined_features = torch.cat([gaia_features, spectra_features], dim=1)
+        print(f'Combined features shape: {combined_features.shape}')
+
+        fused_features = self.cross_attention(combined_features)
+        print(f'Fused features shape: {fused_features.shape}')
+
+        # Global average pooling and classification
+        pooled_features = fused_features.mean(dim=1)
+        print(f'Pooled features shape: {pooled_features.shape}')
+
+        output = self.classifier(pooled_features)
+
+        return outputdef train_model_mamba_fusion(
+    model, train_loader, val_loader, test_loader, 
+    num_epochs=500, lr=1e-4, max_patience=20, device='cuda'
+):
+    # Move model to device
+    model = model.to(device)
+
+    # Define optimizer, scheduler, and loss function
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=int(max_patience / 3), verbose=True
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_loss = float('inf')
+    patience = max_patience
+
+    for epoch in range(num_epochs):
+        # Resample training and validation data if needed
+        train_loader.dataset.re_sample()
+        val_loader.dataset.balance_classes()
+
+        # Training phase
+        model.train()
+        train_loss, train_accuracy = 0.0, 0.0
+
+        for spectra_batch, gaia_batch, y_batch in train_loader:
+            spectra_batch, gaia_batch, y_batch = (
+                spectra_batch.to(device),
+                gaia_batch.to(device),
+                y_batch.to(device)
+            )
+            optimizer.zero_grad()
+            # Ensure the correct order of inputs
+            outputs = model(gaia_batch, spectra_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * spectra_batch.size(0)
+            train_accuracy += (outputs.argmax(dim=1) == y_batch).float().mean().item()
+
+        # Validation phase
+        model.eval()
+        val_loss, val_accuracy = 0.0, 0.0
+        with torch.no_grad():
+            for spectra_val, gaia_val, y_val in val_loader:
+                spectra_val, gaia_val, y_val = (
+                    spectra_val.to(device),
+                    gaia_val.to(device),
+                    y_val.to(device)
+                )
+                outputs = model(gaia_val, spectra_val)
+                loss = criterion(outputs, y_val)
+
+                val_loss += loss.item() * spectra_val.size(0)
+                val_accuracy += (outputs.argmax(dim=1) == y_val).float().mean().item()
+
+        # Test phase and metric collection
+        test_loss, test_accuracy = 0.0, 0.0
+        y_true, y_pred = [], []
+        with torch.no_grad():
+            for spectra_test, gaia_test, y_test in test_loader:
+                spectra_test, gaia_test, y_test = (
+                    spectra_test.to(device),
+                    gaia_test.to(device),
+                    y_test.to(device)
+                )
+                outputs = model(gaia_test, spectra_test)
+                loss = criterion(outputs, y_test)
+
+                test_loss += loss.item() * spectra_test.size(0)
+                test_accuracy += (outputs.argmax(dim=1) == y_test).float().mean().item()
+                y_true.extend(y_test.cpu().numpy())
+                y_pred.extend(outputs.argmax(dim=1).cpu().numpy())
+
+        # Update scheduler
+        scheduler.step(val_loss / len(val_loader.dataset))
+
+        # Log metrics to WandB
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss / len(train_loader.dataset),
+            "val_loss": val_loss / len(val_loader.dataset),
+            "train_accuracy": train_accuracy / len(train_loader),
+            "val_accuracy": val_accuracy / len(val_loader),
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "test_loss": test_loss / len(test_loader.dataset),
+            "test_accuracy": test_accuracy / len(test_loader),
+            "confusion_matrix": wandb.plot.confusion_matrix(
+                probs=None, y_true=y_true, preds=y_pred, class_names=np.unique(y_true)
+            ),
+            "classification_report": classification_report(
+                y_true, y_pred, target_names=[str(i) for i in range(len(np.unique(y_true)))]
+            )
+        })
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience = max_patience
+            best_model = model.state_dict()
+        else:
+            patience -= 1
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+
+    # Load the best model weights
+    model.load_state_dict(best_model)
+    return model
+
