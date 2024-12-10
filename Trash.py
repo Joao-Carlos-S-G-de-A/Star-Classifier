@@ -5239,3 +5239,34 @@ class DualMambaClassifier(nn.Module):
         
         output = self.classifier(pooled_features)
         return output
+# Select the relevant gaia columns to normalize
+gaia_cols = ["parallax", "ra", "dec", "ra_error", "dec_error", "parallax_error", "pmra", "pmdec", "pmra_error", "pmdec_error",
+                "phot_g_mean_flux", "flagnopllx", "phot_g_mean_flux_error", "phot_bp_mean_flux", "phot_rp_mean_flux",
+                "phot_bp_mean_flux_error", "phot_rp_mean_flux_error", "flagnoflux"]
+
+# Get the train and test data for gaia normalization
+train_gaia = train_data[gaia_cols]
+
+# Initialize the PowerTransformer for Yeo-Johnson transformation
+pt = PowerTransformer(method='yeo-johnson', standardize=True)
+
+# Fit the PowerTransformer for each column and store the lambda values
+lambdas = {}
+for column in train_gaia.columns:
+    pt.fit(train_gaia[[column]])
+    lambdas[column] = pt.lambdas_
+
+# Display the lambda values for each column
+for column, lambda_value in lambdas.items():
+    print(f"Lambda value for {column}: {lambda_value}")
+
+print(column, lambda_value)
+
+print(lambdas.items())
+print(train_gaia.columns)
+
+# Apply the Yeo-Johnson transformation to the train data with the lambda values
+for column in train_gaia.columns:
+    print(column)
+    train_gaia[column] = pt.transform(train_gaia[[column]])
+
