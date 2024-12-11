@@ -5270,3 +5270,104 @@ for column in train_gaia.columns:
     print(column)
     train_gaia[column] = pt.transform(train_gaia[[column]])
 
+
+batch_size = 16
+
+# If X exists, delete it
+if 'X' in locals():   
+    del X, y
+gc.collect()
+
+# Example usage
+if __name__ == "__main__":
+    # Load and preprocess your data (example from original script)
+    # Load and preprocess data
+    X = pd.read_pickle("Pickles/train_data_transformed.pkl")
+    classes = pd.read_pickle("Pickles/List_of_Classes.pkl")
+    y = X[classes]
+
+    #label_mapping = {'star': 0, 'binary_star': 1, 'galaxy': 2, 'agn': 3}
+    #y = y.map(label_mapping).values
+
+    # Drop gaia data
+    X = X.drop(["parallax", "ra", "dec", "ra_error", "dec_error", "parallax_error", "pmra", "pmdec", "pmra_error", "pmdec_error", 
+                "phot_g_mean_flux", "flagnopllx", "phot_g_mean_flux_error", "phot_bp_mean_flux", "phot_rp_mean_flux", 
+                "phot_bp_mean_flux_error", "phot_rp_mean_flux_error", "obsid"], axis=1).values
+    # Drop labels
+    X = X.drop(classes, axis=1).values
+
+    print(X.shape, y.shape)
+    
+    # Read test data
+    X_test = pd.read_pickle("Pickles/testv2.pkl")
+    y_test = X_test[classes]
+    X_test = X_test.drop(["parallax", "ra", "dec", "ra_error", "dec_error", "parallax_error", "pmra", "pmdec", "pmra_error", "pmdec_error", 
+                "phot_g_mean_flux", "flagnopllx", "phot_g_mean_flux_error", "phot_bp_mean_flux", "phot_rp_mean_flux", 
+                "phot_bp_mean_flux_error", "phot_rp_mean_flux_error", "obsid"], axis=1).values
+    X_test = X_test.drop(classes, axis=1).values
+
+    print(X_test.shape, y_test.shape)
+    
+    # Split validation data
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Clear memory
+    del X, y
+    gc.collect()
+
+    # Convert to torch tensors and create datasets
+    X_train = torch.tensor(X_train, dtype=torch.float32).unsqueeze(1)
+    X_val = torch.tensor(X_val, dtype=torch.float32).unsqueeze(1)
+    y_train = torch.tensor(y_train, dtype=torch.long)
+    y_val = torch.tensor(y_val, dtype=torch.long)
+
+    train_dataset = BalancedDataset(X_train, y_train)
+    val_dataset = BalancedValidationDataset(X_val, y_val)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(BalancedValidationDataset(torch.tensor(X_test, dtype=torch.float32).unsqueeze(1),
+                                                    torch.tensor(y_test, dtype=torch.long)), batch_size=batch_size, shuffle=False)
+    # Define the model with your parameters
+d_model = 2048 # Embedding dimension
+num_classes = 4  # Star classification categories
+input_dim = 3647
+
+# Define the training parameters
+num_epochs = 500
+lr = 2e-7
+patience = 50   
+depth = 6
+
+# Define the config dictionary object
+config = {"num_classes": num_classes, "batch_size": batch_size, "lr": lr, "patience": patience, "num_epochs": num_epochs, "d_model": d_model, "depth": depth}
+
+# Initialize WandB project
+wandb.init(project="lamost-mamba-test", entity="joaoc-university-of-southampton", config=config)
+# Initialize and train the model
+# Train the model using your `train_model_vit` or an adjusted training loop
+model_mamba = StarClassifierMAMBA(d_model=d_model, num_classes=num_classes, input_dim=input_dim, n_layers=depth)
+print(model_mamba)
+# print number of parameters per layer
+for name, param in model_mamba.named_parameters():
+    print(name, param.numel())
+print("Total number of parameters:", sum(p.numel() for p in model_mamba.parameters() if p.requires_grad))
+
+# Move the model to device
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model_mamba = model_mamba.to(device)
+
+# Train the model using your `train_model_vit` or an adjusted training loop
+trained_model = train_model_mamba(
+    model=model_mamba,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    test_loader=test_loader,
+    num_epochs=num_epochs,
+    lr=lr,
+    max_patience=patience,
+    device=device
+)
+# Save the model and finish WandB session
+wandb.finish()
+    
