@@ -5371,3 +5371,85 @@ trained_model = train_model_mamba(
 # Save the model and finish WandB session
 wandb.finish()
     
+# Load the filtered DataFrame and the updated list of label columns
+filtered_df = pd.read_pickle("Pickles/filtered_multi_hot_encoded.pkl")
+updated_label_columns = pd.read_pickle("Pickles/Updated_List_of_Classes.pkl")
+
+# Step 4: Prepare X (features) and y (labels) for stratified splitting
+X = filtered_df.drop(columns=updated_label_columns)  # Features
+y = filtered_df[updated_label_columns]  # Multi-labels (multi-hot encoding)
+
+# Step 5: Use MultilabelStratifiedKFold to split the data
+mskf = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+for train_index, test_index in mskf.split(X, y):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+    break  # Take only the first split to simulate a train-test split
+
+# Recombine the train and test DataFrames if needed
+train_df = pd.concat([X_train, y_train], axis=1)
+test_df = pd.concat([X_test, y_test], axis=1)
+
+# Save train and test sets if needed
+train_df.to_pickle("Pickles/train_df.pkl")
+test_df.to_pickle("Pickles/test_df.pkl")
+
+
+
+class BalancedDataset(Dataset):
+    def __init__(self, X, y, limit_per_label=201):
+        self.X = X
+        self.y = y
+        self.limit_per_label = limit_per_label
+        self.classes = np.unique(y)
+        self.indices = self.balance_classes()
+
+    def balance_classes(self):
+        indices = []
+        for cls in self.classes:
+            cls_indices = np.where(self.y == cls)[0]
+            # Set limit per label except for the * label
+            if cls == "*":
+                print("Skipping limit for * label")
+            elif len(cls_indices) > self.limit_per_label:
+                cls_indices = np.random.choice(cls_indices, self.limit_per_label, replace=False)
+            indices.extend(cls_indices)
+        np.random.shuffle(indices)
+        return indices
+
+    def re_sample(self):
+        self.indices = self.balance_classes()
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        index = self.indices[idx]
+        return self.X[index], self.y[index]
+
+
+    # Custom Dataset for validation with limit per class
+class BalancedValidationDataset(Dataset):
+    def __init__(self, X, y, limit_per_label=100):
+        self.X = X
+        self.y = y
+        self.limit_per_label = limit_per_label
+        self.classes = np.unique(y)
+        self.indices = self.balance_classes()
+
+    def balance_classes(self):
+        indices = []
+        for cls in self.classes:
+            cls_indices = np.where(self.y == cls)[0]
+            if len(cls_indices) > self.limit_per_label:
+                cls_indices = np.random.choice(cls_indices, self.limit_per_label, replace=False)
+            indices.extend(cls_indices)
+        np.random.shuffle(indices)
+        return indices
+    
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        index = self.indices[idx]
+        return self.X[index], self.y[index]
