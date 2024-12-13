@@ -5453,3 +5453,27 @@ class BalancedValidationDataset(Dataset):
     def __getitem__(self, idx):
         index = self.indices[idx]
         return self.X[index], self.y[index]
+    
+    # Load the merged data and the list of classes
+df = pd.read_pickle("Pickles/merged_multi_hot_encoded_no_star.pkl")
+label_columns = pd.read_pickle("Pickles/List_of_Classes_no_star.pkl")
+
+# Step 1: Count the occurrences of each label (sum of 1s in each column)
+label_counts = df[label_columns].sum()
+
+# Step 2: Drop label columns (classes) that have fewer than 2 occurrences
+frequent_labels = label_counts[label_counts >= 2].index
+#filtered_df = df[frequent_labels.union(df.columns.difference(label_columns))]  # Keep non-label columns
+non_label_columns = df.columns.difference(label_columns)
+filtered_df = df[list(frequent_labels) + list(non_label_columns)]
+
+# Step 3: Remove samples (rows) that have no active labels
+mask = filtered_df[frequent_labels].sum(axis=1) > 0  # Keep only rows with at least one active label
+filtered_df = filtered_df.loc[mask]
+
+# Update the list of label columns (since some columns were dropped)
+updated_label_columns = [col for col in frequent_labels if col in filtered_df.columns]
+
+# Save the updated list of label columns and the filtered DataFrame
+pd.to_pickle(updated_label_columns, "Pickles/Updated_List_of_Classes.pkl")
+filtered_df.to_pickle("Pickles/filtered_multi_hot_encoded.pkl")
