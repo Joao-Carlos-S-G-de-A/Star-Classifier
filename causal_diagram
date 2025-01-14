@@ -1,0 +1,27 @@
+
+digraph G {
+    X1 [label="X_1", color="red", shape="circle"]
+    X2 [label="X_2", color="red", shape="circle"]
+    X3 [label="X_3", color="red", shape="circle"]
+    B1 [label="B_1", color="green", shape="square"]
+    B2 [label="B_2", color="green", shape="square"]
+    B3 [label="B_3", color="green", shape="square"]
+    h1 [label="h_t=1", color="gray"]
+    h2 [label="h_t=2", color="gray"]
+    h3 [label="h_t=3", color="gray"]
+    A1 [label="A", color="goldenrod", shape="square"]
+    A2 [label="A", color="goldenrod", shape="square"]
+    C1 [label="C_1", color="blue"]
+    C2 [label="C_2", color="blue"]
+    C3 [label="C_3", color="blue"]
+    y1 [label="y1", color="purple"]
+    y2 [label="y2", color="purple"]
+    y3 [label="y3", color="purple"]
+
+    X1 -> B1 -> h1 -> C1 -> y1
+    h1 -> A1 -> h2
+    X2 -> B2 -> h2 -> C2 -> y2
+    h2 -> A2 -> h3
+    X3 -> B3 -> h3 -> C3 -> y3
+    
+}
