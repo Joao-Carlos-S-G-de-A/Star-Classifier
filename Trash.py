@@ -5477,3 +5477,131 @@ updated_label_columns = [col for col in frequent_labels if col in filtered_df.co
 # Save the updated list of label columns and the filtered DataFrame
 pd.to_pickle(updated_label_columns, "Pickles/Updated_List_of_Classes.pkl")
 filtered_df.to_pickle("Pickles/filtered_multi_hot_encoded.pkl")
+
+def calculate_sample_weights(y):
+    """
+    Compute per-sample weights based on the inverse frequency of the labels in a multi-label setting.
+
+    Args:
+    - y (numpy.ndarray): Multi-hot encoded labels (num_samples, num_classes)
+
+    Returns:
+    - sample_weights (numpy.ndarray): Weight per sample (num_samples,)
+    """
+    class_counts = np.sum(y, axis=0)  # Number of times each class appears
+    class_weights = np.where(class_counts > 0, 1.0 / class_counts, 0)  # Inverse class frequency
+
+    # Compute per-sample weight as the sum of its class weights
+    sample_weights = np.sum(y * class_weights, axis=1)
+    return sample_weights
+
+
+class BalancedMultiLabelDataset(Dataset):
+    def __init__(self, X, y, limit_per_label=201):
+        self.X = X
+        self.y = y
+        self.limit_per_label = limit_per_label
+        self.num_classes = y.shape[1]
+        self.indices = self.balance_classes()
+        self.sample_weights = torch.tensor(calculate_sample_weights(y.numpy()), dtype=torch.float)
+
+    def balance_classes(self):
+        indices = []
+        for cls in range(self.num_classes):
+            cls_indices = np.where(self.y[:, cls] == 1)[0]
+            if len(cls_indices) < self.limit_per_label:
+                extra_indices = np.random.choice(cls_indices, self.limit_per_label - len(cls_indices), replace=True)
+                cls_indices = np.concatenate([cls_indices, extra_indices])
+            elif len(cls_indices) > self.limit_per_label:
+                cls_indices = np.random.choice(cls_indices, self.limit_per_label, replace=False)
+            indices.extend(cls_indices)
+        np.random.shuffle(indices)
+        return indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        index = self.indices[idx]
+        return self.X[index], self.y[index], self.sample_weights[index]  # Include per-sample weight
+    
+    
+def train_model_mamba(
+    model, train_loader, val_loader, test_loader, 
+    num_epochs=500, lr=1e-4, max_patience=20, device='cuda'
+):
+    model = model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=int(max_patience / 5)
+    )
+    
+    best_val_loss = float('inf')
+    patience = max_patience
+
+    for epoch in range(num_epochs):
+        train_loader.dataset.re_sample()  # Resample training data
+        
+        # Compute sample weights
+        all_labels = []
+        for _, y_batch in train_loader:
+            all_labels.extend(y_batch.cpu().numpy())
+
+        sample_weights = calculate_sample_weights(np.array(all_labels))
+        sample_weights = torch.tensor(sample_weights, dtype=torch.float).to(device)
+
+        # Define weighted loss function
+        criterion = nn.BCEWithLogitsLoss(reduction='none')  # No reduction yet, as we will weight manually
+
+        model.train()
+        train_loss = 0.0
+
+        for X_batch, y_batch, w_batch in zip(train_loader, sample_weights):
+            X_batch, y_batch, w_batch = X_batch.to(device), y_batch.to(device), w_batch.to(device)
+            optimizer.zero_grad()
+
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)  # Shape: (batch_size, num_classes)
+
+            # Apply per-sample weights (element-wise multiplication)
+            loss = (loss * w_batch.unsqueeze(1)).mean()  # Apply weight per sample and average
+
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * X_batch.size(0)
+
+        # Validation loop (no per-sample weighting needed)
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_val, y_val in val_loader:
+                X_val, y_val = X_val.to(device), y_val.to(device)
+                outputs = model(X_val)
+                loss = criterion(outputs, y_val).mean()
+                val_loss += loss.item() * X_val.size(0)
+
+        scheduler.step(val_loss / len(val_loader.dataset))
+
+        # Log results
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss / len(train_loader.dataset),
+            "val_loss": val_loss / len(val_loader.dataset),
+            "learning_rate": optimizer.param_groups[0]['lr']
+        })
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience = max_patience
+            best_model = model.state_dict()
+        else:
+            patience -= 1
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+
+    model.load_state_dict(best_model)
+    return model
+
