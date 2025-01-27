@@ -20,3 +20,4 @@ mlruns/
 wandb/
 Data_Preparation/Pickles/
 Data_Preparation/star_spectra1/
+lamost_spectra_uniques/

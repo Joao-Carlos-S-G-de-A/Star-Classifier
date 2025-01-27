@@ -5605,3 +5605,77 @@ def train_model_mamba(
     model.load_state_dict(best_model)
     return model
 
+def predict_star_labels(gaia_ids, model_path, lamost_catalog, output_pickle="predicted_labels.pkl"):
+    """
+    Given a list of Gaia DR3 IDs, this function:
+    1) Queries Gaia for star parameters.
+    2) Cross-matches with LAMOST spectra.
+    3) Downloads and processes LAMOST spectra.
+    4) Normalizes both Gaia and LAMOST data.
+    5) Applies a trained StarClassifierFusion model to predict labels.
+    
+    Args:
+        gaia_ids (list): List of Gaia DR3 source IDs.
+        model_path (str): Path to the trained model file.
+        lamost_catalog (str): Path to the LAMOST catalog CSV.
+        output_pickle (str): Path to save the final predictions.
+    
+    Returns:
+        DataFrame with Gaia IDs and predicted multi-label classifications.
+    """
+
+    print("\n🚀 Step 1: Querying Gaia data...")
+    df_gaia = query_gaia_data(gaia_ids)
+    if df_gaia.empty:
+        print("⚠️ No Gaia data found. Exiting.")
+        return None
+
+    print("\n🔄 Step 2: Cross-matching with LAMOST catalog...")
+    df_matched = crossmatch_lamost(df_gaia, lamost_catalog)
+    if df_matched.empty:
+        print("⚠️ No LAMOST matches found. Exiting.")
+        return None
+
+    print("\n📥 Step 3: Downloading LAMOST spectra (if needed)...")
+    obsids = df_matched["obsid"].unique()
+    spectra_folder = "lamost_spectra"
+    downloaded_obsids = download_lamost_spectra(obsids, save_folder=spectra_folder, num_workers=50)
+
+    print("\n🔧 Step 4: Processing LAMOST spectra...")
+    df_interpolated, failed_files = process_lamost_spectra(spectra_folder)
+
+    if df_interpolated.empty:  # ✅ Now correctly checking the DataFrame
+        print("⚠️ No processed LAMOST spectra found. Exiting.")
+        return None
+
+    print("\n📊 Step 5: Normalizing LAMOST and Gaia features...")
+    lamost_normalized = normalize_lamost_spectra(df_interpolated)
+    gaia_normalized = apply_gaia_transforms(df_gaia, gaia_transformers)
+
+    print("\n🔗 Step 6: Merging normalized Gaia and LAMOST data...")
+    gaia_lamost_match = df_matched[["source_id", "obsid"]]
+    lamost_normalized["obsid"] = lamost_normalized["obsid"].astype(int)
+    gaia_lamost_match["obsid"] = gaia_lamost_match["obsid"].astype(int)
+
+    lamost_normalized["source_id"] = lamost_normalized["obsid"].map(gaia_lamost_match.set_index("obsid")["source_id"])
+    gaia_lamost_merged = pd.merge(gaia_normalized, lamost_normalized, on="source_id", how="inner")
+
+    if gaia_lamost_merged.empty:
+        print("⚠️ No valid data after merging. Exiting.")
+        return None
+
+    print("\n🤖 Step 7: Predicting labels using the trained model...")
+    predictions = process_star_data_fusion(
+        model_path=model_path,
+        data_path=gaia_lamost_merged,
+        classes_path="Pickles/Updated_list_of_Classes.pkl",
+        sigmoid_constant=0.5
+    )
+
+    print("\n💾 Step 8: Saving predictions...")
+    df_predictions = pd.DataFrame(predictions, columns=pd.read_pickle("Pickles/Updated_list_of_Classes.pkl"))
+    df_predictions["source_id"] = gaia_lamost_merged["source_id"].values
+    df_predictions.to_pickle(output_pickle)
+
+    print(f"\n✅ Predictions saved to {output_pickle}")
+    return df_predictions
