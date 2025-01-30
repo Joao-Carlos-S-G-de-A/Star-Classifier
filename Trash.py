@@ -5679,3 +5679,165 @@ def predict_star_labels(gaia_ids, model_path, lamost_catalog, output_pickle="pre
 
     print(f"\n✅ Predictions saved to {output_pickle}")
     return df_predictions
+
+
+def query_gaia_data(gaia_id_list):
+    """
+    Given a list of Gaia DR3 source IDs, queries the Gaia archive
+    for the relevant columns used during training.
+    Returns a concatenated DataFrame of results.
+    """
+    # Columns you actually need (adapt to match your pipeline!)
+    # e.g. ra, dec, pmra, pmdec, phot_g_mean_flux, ...
+    desired_cols = [
+        "source_id", "ra", "ra_error", "dec", "dec_error",
+        "pmra", "pmra_error", "pmdec", "pmdec_error",
+        "parallax", "parallax_error",
+        "phot_g_mean_flux", "phot_g_mean_flux_error",
+        "phot_bp_mean_flux", "phot_bp_mean_flux_error",
+        "phot_rp_mean_flux", "phot_rp_mean_flux_error"
+    ]
+
+    all_dfs = []
+    print(f"🔍 Unique Gaia IDs before query: {len(set(gaia_id_list))}")
+    chunks = split_ids_into_chunks(gaia_id_list, chunk_size=30000)
+    for chunk in chunks:
+        query = f"""
+        SELECT {', '.join(desired_cols)}
+        FROM gaiadr3.gaia_source
+        WHERE source_id IN ({chunk})
+        """
+        job = Gaia.launch_job_async(query)
+        tbl = job.get_results()
+        df_tmp = tbl.to_pandas()
+        all_dfs.append(df_tmp)
+
+    # Print a warning if some IDs were not found
+    all_ids = pd.concat(all_dfs)["source_id"].values
+    print(f"🔍 Found {len(all_ids)} IDs in Gaia DR3.")
+    missing_ids = set(gaia_id_list) - set(all_ids)
+    if missing_ids:
+        print(f"Warning: {len(missing_ids)} IDs not found in Gaia DR3.")
+        print(f"Missing IDs: {missing_ids}")
+
+    print(set(all_ids).difference(set(gaia_id_list)))  # Extra IDs
+    print(set(gaia_id_list).difference(set(all_ids)))  # Missing IDs
+
+
+    if not all_dfs:
+        return pd.DataFrame(columns=desired_cols)
+    else:
+        return pd.concat(all_dfs, ignore_index=True)        
+    
+
+        gaia_lamost_match = df_matched[["source_id", "obsid"]]
+
+    # Troubleshooting duplicate obsids
+    duplicate_obsids = gaia_lamost_match["obsid"].duplicated().sum()
+    print(f"⚠️ Found {duplicate_obsids} duplicated obsid values in Gaia-LAMOST match.")
+    print(gaia_lamost_match["obsid"].value_counts().head(10))
+
+
+    spectrum_normalized["source_id"] = spectrum_normalized["obsid"].astype(int).map(gaia_lamost_match.set_index("obsid")["source_id"])
+    gaia_lamost_merged = pd.merge(gaia_normalized, spectrum_normalized, on="source_id", how="inner")
+
+    if gaia_lamost_merged.empty:
+        print("⚠️ No valid data after merging. Exiting.")
+        return None
+    
+    
+def crossmatch_lamost(gaia_df, lamost_df, match_radius=3*u.arcsec):
+    """
+    Cross-matches Gaia sources with a local LAMOST catalogue.
+    Returns a merged DataFrame of matched objects.
+    """
+
+    # Ensure RA/Dec are numeric
+    gaia_df['ra'] = pd.to_numeric(gaia_df['ra'], errors='coerce')
+    gaia_df['dec'] = pd.to_numeric(gaia_df['dec'], errors='coerce')
+    lamost_df['ra'] = pd.to_numeric(lamost_df['ra'], errors='coerce')
+    lamost_df['dec'] = pd.to_numeric(lamost_df['dec'], errors='coerce')
+
+    # Drop NaN values
+    gaia_df = gaia_df.dropna(subset=['ra', 'dec'])
+    lamost_df = lamost_df.dropna(subset=['ra', 'dec'])
+
+    print("🔍 Gaia RA/Dec sample:", gaia_df[['ra', 'dec']].head())
+    print("🔍 LAMOST RA/Dec sample:", lamost_df[['ra', 'dec']].head())
+
+
+    print(f"After NaN removal: Gaia={gaia_df.shape}, LAMOST={lamost_df.shape}")
+
+    # Check if LAMOST coordinates are in arcseconds (convert if necessary)
+    if lamost_df['ra'].max() > 360:  # RA should not exceed 360 degrees
+        print("⚠️ LAMOST RA/Dec seem to be in arcseconds. Converting to degrees.")
+        lamost_df['ra'] /= 3600
+        lamost_df['dec'] /= 3600
+
+    # Convert to SkyCoord objects in arcseconds (ensuring same frame)
+    gaia_coords = SkyCoord(ra=gaia_df['ra'].values*u.deg,
+                           dec=gaia_df['dec'].values*u.deg,
+                           frame='icrs')
+
+    lamost_coords = SkyCoord(ra=lamost_df['ra'].values*u.deg,
+                             dec=lamost_df['dec'].values*u.deg,
+                             frame='icrs')
+
+    # Perform crossmatch
+    idx, d2d, _ = gaia_coords.match_to_catalog_sky(lamost_coords)
+
+    # Apply matching radius filter
+    matches = d2d < match_radius
+
+    # Print match distances only for successful matches
+    print(f"Maximum match distance (arcsec): {d2d[matches].max()*3600}")
+    print(f"Mean match distance (arcsec): {d2d[matches].mean()*3600}")
+
+    if matches.sum() == 0:
+        print("⚠️ No matches found! Try increasing `match_radius`.")
+        return pd.DataFrame()
+
+    # Extract matched rows correctly
+    gaia_matched = gaia_df.iloc[matches].copy().reset_index(drop=True)
+    #lamost_matched = lamost_df.iloc[idx[matches]].copy().reset_index(drop=True) 
+    lamost_matched = lamost_df.iloc[np.where(matches)].copy().reset_index(drop=True)
+
+
+    print(f"Matched Gaia Objects: {gaia_matched.shape}")
+    print(f"Matched LAMOST Objects: {lamost_matched.shape}")
+
+    # Merge matches into final DataFrame
+    final = pd.concat([gaia_matched, lamost_matched], axis=1)
+
+    return final
+
+def crossmatch_lamost(gaia_df, lamost_df, match_radius=3*u.arcsec):
+    """
+    Cross-match the Gaia DataFrame with a local LAMOST catalogue CSV
+    (which must have 'ra' and 'dec' columns).
+    Returns a merged DataFrame containing only matched objects, plus LAMOST obsid, etc.
+    """
+    # Basic cleaning
+    lamost_df = lamost_df.dropna(subset=['ra','dec'])
+    gaia_df = gaia_df.dropna(subset=['ra','dec'])
+
+    # Create astropy SkyCoord objects
+    gaia_coords   = SkyCoord(ra=gaia_df['ra'].values*u.deg,
+                             dec=gaia_df['dec'].values*u.deg)
+    lamost_coords = SkyCoord(ra=lamost_df['ra'].values*u.deg,
+                             dec=lamost_df['dec'].values*u.deg)
+    # Print the coordinates
+    print(f"Gaia Coords: {gaia_coords[:3]}")
+    print(f"LAMOST Coords: {lamost_coords[:3]}")
+
+    # Match to catalog
+    idx, sep2d, _ = gaia_coords.match_to_catalog_sky(lamost_coords)
+    matches = sep2d < match_radius
+
+    # Subset
+    gaia_matched   = gaia_df.iloc[matches].copy().reset_index(drop=True)
+    lamost_matched = lamost_df.iloc[idx[matches]].copy().reset_index(drop=True)
+
+    # Merge into single DataFrame
+    final = pd.concat([gaia_matched, lamost_matched], axis=1)
+    return final
