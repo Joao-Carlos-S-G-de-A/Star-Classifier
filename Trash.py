@@ -5841,3 +5841,335 @@ def crossmatch_lamost(gaia_df, lamost_df, match_radius=3*u.arcsec):
     # Merge into single DataFrame
     final = pd.concat([gaia_matched, lamost_matched], axis=1)
     return final
+
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from astropy.io import fits
+
+def plot_spectrum_with_gaia(source_id, gaia_lamost_merged, spectra_folder="lamost_spectra_uniques"):
+    """
+    Plots the LAMOST spectrum from FITS files and displays Gaia parameters below it.
+    
+    :param source_id: Gaia Source ID of the incorrectly classified source
+    :param gaia_lamost_merged: DataFrame containing Gaia and LAMOST cross-matched data
+    :param spectra_folder: Path to the folder containing LAMOST FITS spectra
+    """
+    try:
+        # Ensure 'obsid' column exists
+        if 'obsid' not in gaia_lamost_merged.columns:
+            print(f"⚠️ 'obsid' column not found in gaia_lamost_merged.")
+            return
+        
+        match = gaia_lamost_merged.loc[gaia_lamost_merged['source_id'] == source_id]
+        if match.empty:
+            print(f"⚠️ No LAMOST match found for source_id {source_id}.")
+            return
+        
+        obsid = int(match.iloc[0]['obsid'])  # Ensure obsid is an integer
+        print(f"Found match: Source ID {source_id} -> ObsID {obsid}")
+        
+        # Construct FITS file path
+        fits_path = f"{spectra_folder}/{int(obsid)}"
+        
+        # Load FITS data
+        with fits.open(fits_path) as hdul:
+            data = hdul[0].data
+            if data is None or data.shape[0] < 3:
+                print(f"⚠️ Skipping {obsid}: Data not found or incorrect format.")
+                return
+            
+            flux = data[0]  # First row is flux
+            wavelength = data[2]  # Third row is wavelength
+            
+            fig, ax = plt.subplots(2, 1, figsize=(10, 6), gridspec_kw={'height_ratios': [3, 1]})
+            
+            # Plot Spectrum
+            ax[0].plot(wavelength, flux, color='blue', alpha=0.7, lw=1)
+            ax[0].set_xlabel("Wavelength (Å)")
+            ax[0].set_ylabel("Flux")
+            ax[0].set_title(f"LAMOST Spectrum for Gaia Source ID: {source_id} (LAMOST ObsID: {obsid})")
+            ax[0].grid()
+            
+            # Show Gaia Data in a bar plot
+            gaia_info = match.drop(columns=["source_id", "obsid"], errors='ignore')
+            # drop columns with flux_ prefix
+            gaia_info = gaia_info.loc[:, ~gaia_info.columns.str.startswith("flux_")]
+            if not gaia_info.empty:
+                ax[1].barh(gaia_info.columns, gaia_info.values[0], color='skyblue')
+                ax[1].set_title("Gaia Parameters")
+            else:
+                ax[1].text(0.5, 0.5, "No Gaia Data Available", ha='center', va='center', fontsize=12)
+                ax[1].axis("off")
+            plt.show()
+    except Exception as e:
+        print(f"Error loading {fits_path}: {e}")
+
+gaia_lamost_merged['obsid'] = gaia_lamost_merged['obsid'].astype(int)
+gaia_lamost_merged['source_id'] = gaia_lamost_merged['source_id'].astype(int)
+#print(gaia_lamost_merged.head())
+incorrect_gaia_ids2 = incorrect_gaia_ids.astype(int)
+
+# Loop through incorrectly classified sources and plot spectra
+for source_id in incorrect_gaia_ids2:
+    plot_spectrum_with_gaia(source_id, gaia_lamost_merged)
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from astropy.io import fits
+
+def plot_spectrum_with_gaia(source_id, gaia_lamost_merged, spectra_folder="lamost_spectra_uniques"):
+    """
+    Plots the LAMOST spectrum from FITS files and displays Gaia parameters below it.
+    
+    :param source_id: Gaia Source ID of the incorrectly classified source
+    :param gaia_lamost_merged: DataFrame containing Gaia and LAMOST cross-matched data
+    :param spectra_folder: Path to the folder containing LAMOST FITS spectra
+    """
+    try:
+        # Ensure 'obsid' column exists
+        if 'obsid' not in gaia_lamost_merged.columns:
+            print(f"⚠️ 'obsid' column not found in gaia_lamost_merged.")
+            return
+        
+        match = gaia_lamost_merged.loc[gaia_lamost_merged['source_id'] == source_id]
+        if match.empty:
+            print(f"⚠️ No LAMOST match found for source_id {source_id}.")
+            return
+        
+        obsid = match.iloc[0]['obsid']
+        print(f"Found match: Source ID {source_id} -> ObsID {obsid}")
+        
+        # Construct FITS file path
+        fits_path = f"{spectra_folder}/{int(obsid)}"
+        
+        # Load FITS data
+        with fits.open(fits_path) as hdul:
+            data = hdul[0].data
+            if data is None or data.shape[0] < 3:
+                print(f"⚠️ Skipping {obsid}: Data not found or incorrect format.")
+                return
+            
+            flux = data[0]  # First row is flux
+            wavelength = data[2]  # Third row is wavelength
+            
+            fig, ax = plt.subplots(2, 1, figsize=(10, 6), gridspec_kw={'height_ratios': [3, 1]})
+            
+            # Plot Spectrum
+            ax[0].plot(wavelength, flux, color='blue', alpha=0.7, lw=1)
+            ax[0].set_xlabel("Wavelength (Å)")
+            ax[0].set_ylabel("Flux")
+            ax[0].set_title(f"LAMOST Spectrum for Source ID: {source_id} (ObsID: {obsid})")
+            ax[0].grid()
+            
+            gaia_info = match.drop(columns=["source_id", "obsid"], errors='ignore')
+            if not gaia_info.empty:
+                table_data = gaia_info.iloc[0].to_dict()
+                column_labels = list(table_data.keys())
+                cell_values = [[table_data[col]] for col in column_labels]
+                
+                ax[1].axis("tight")
+                ax[1].axis("off")
+                ax[1].table(cellText=cell_values, colLabels=column_labels, cellLoc='center', loc='center')
+            else:
+                ax[1].text(0.5, 0.5, "No Gaia Data Available", ha='center', va='center', fontsize=12)
+                ax[1].axis("off")
+            
+            plt.tight_layout()
+            plt.show()
+    except Exception as e:
+        print(f"Error loading {fits_path}: {e}")
+gaia_lamost_merged['obsid'] = gaia_lamost_merged['obsid'].astype(int)
+gaia_lamost_merged['source_id'] = gaia_lamost_merged['source_id'].astype(int)
+#print(gaia_lamost_merged.head())
+incorrect_gaia_ids2 = incorrect_gaia_ids.astype(int)
+bunda
+
+# Loop through incorrectly classified sources and plot spectra
+for source_id in incorrect_gaia_ids2:
+    plot_spectrum_with_gaia(source_id, gaia_lamost_merged)
+
+
+def plot_spectrum_with_gaia(source_id, gaia_lamost_merged, spectra_folder="lamost_spectra_uniques"):
+    """
+    Plots the LAMOST spectrum from FITS files and displays Gaia parameters below it.
+    
+    :param source_id: Gaia Source ID of the incorrectly classified source
+    :param gaia_lamost_merged: DataFrame containing Gaia and LAMOST cross-matched data
+    :param spectra_folder: Path to the folder containing LAMOST FITS spectra
+    """
+    try:
+        # Ensure 'obsid' column exists
+        if 'obsid' not in gaia_lamost_merged.columns:
+            print(f"⚠️ 'obsid' column not found in gaia_lamost_merged.")
+            return
+        
+        match = gaia_lamost_merged.loc[gaia_lamost_merged['source_id'] == source_id]
+        if match.empty:
+            print(f"⚠️ No LAMOST match found for source_id {source_id}.")
+            return
+        
+        obsid = int(match.iloc[0]['obsid'])  # Ensure obsid is an integer
+        print(f"Found match: Source ID {source_id} -> ObsID {obsid}")
+        
+        # Construct FITS file path
+        fits_path = f"{spectra_folder}/{int(obsid)}"
+        
+        # Load FITS data
+        with fits.open(fits_path) as hdul:
+            data = hdul[0].data
+            if data is None or data.shape[0] < 3:
+                print(f"⚠️ Skipping {obsid}: Data not found or incorrect format.")
+                return
+            
+            flux = data[0]  # First row is flux
+            wavelength = data[2]  # Third row is wavelength
+            
+            fig, ax = plt.subplots(2, 1, figsize=(10, 10), gridspec_kw={'height_ratios': [3, 3]})
+            
+            # Plot Spectrum
+            ax[0].plot(wavelength, flux, color='blue', alpha=0.7, lw=1)
+            ax[0].set_xlabel("Wavelength (Å)")
+            ax[0].set_ylabel("Flux")
+            ax[0].set_title(f"LAMOST Spectrum for Source ID: {source_id} (ObsID: {obsid})")
+            ax[0].grid()
+            
+            # Show Gaia Data in a Horizontal Bar Plot
+            gaia_info = match.iloc[[0]].drop(columns=["source_id", "obsid"], errors='ignore')
+            # drop columns with flux_ prefix
+            gaia_info = gaia_info.loc[:, ~gaia_info.columns.str.startswith("flux_")]
+            if not gaia_info.empty:
+                gaia_data = gaia_info.to_dict(orient='records')[0]
+                labels = list(gaia_data.keys())
+                values = list(gaia_data.values())
+                
+                ax[1].bar(labels, values, color='skyblue')
+                ax[1].tick_params("x", labelrotation=90)
+                ax[1].set_xlabel("Value")
+                ax[1].set_title("Gaia Parameters")
+            else:
+                ax[1].text(0.5, 0.5, "No Gaia Data Available", ha='center', va='center', fontsize=12)
+                ax[1].axis("off")
+            
+            plt.tight_layout()
+            plt.show()
+    except Exception as e:
+        print(f"Error loading {fits_path}: {e}")
+
+gaia_lamost_merged['obsid'] = gaia_lamost_merged['obsid'].astype(int)
+gaia_lamost_merged['source_id'] = gaia_lamost_merged['source_id'].astype(int)
+#print(gaia_lamost_merged.head())
+incorrect_gaia_ids2 = incorrect_gaia_ids.astype(int)
+bunda
+# Loop through incorrectly classified sources and plot spectra
+for source_id in incorrect_gaia_ids2:
+    plot_spectrum_with_gaia(source_id, gaia_lamost_merged)
+
+def process_lamost_fits_files(folder_path="lamost_spectra_uniques", output_file="Pickles/lamost_data.csv", batch_size=10000):
+    """
+    Processes LAMOST FITS spectra by extracting flux and frequency data.
+    Saves data in a CSV file with batching to optimize memory usage.
+
+    Args:
+        folder_path (str): Path to the folder containing FITS files.
+        output_file (str): Path to the output CSV file.
+        batch_size (int): Number of records to process before writing to the CSV.
+    """
+
+    print("\n📂 Processing LAMOST FITS files...")
+
+    # Create output folder if necessary and delete existing file
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+    # Define column headers
+    columns = [f'col_{i}' for i in range(3748)] + ['file_name', 'row']
+
+    # Initialize the CSV file with headers
+    with open(output_file, 'w') as f:
+        pd.DataFrame(columns=columns).to_csv(f, index=False)
+        f.close()
+
+    # Count total files for progress tracking
+    total_files = sum([len(files) for _, _, files in os.walk(folder_path)])
+
+    batch_list = []
+
+    # Process FITS files
+    with tqdm(total=total_files, desc='Processing FITS files') as pbar:
+        for filename in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, filename)
+            
+            try:
+                with fits.open(file_path) as hdul:
+                    data = hdul[0].data[:3, :3748]  # Extract first 3 rows and 3748 columns
+                    
+                    for i, row_data in enumerate(data):
+                        data_dict = {f'col_{j}': value for j, value in enumerate(row_data)}
+                        data_dict['file_name'] = filename
+                        data_dict['row'] = i  # Track which row from the FITS file
+                        batch_list.append(data_dict)
+                
+                # Write batch to CSV
+                if len(batch_list) >= batch_size:
+                    pd.DataFrame(batch_list).to_csv(output_file, mode='a', header=False, index=False)
+                    batch_list.clear()
+
+            except Exception as e:
+                print(f"⚠️ Error processing {filename}: {e}")
+
+            pbar.update(1)
+
+        # Write any remaining data
+        if batch_list:
+            pd.DataFrame(batch_list).to_csv(output_file, mode='a', header=False, index=False)
+
+
+def download_lamost_spectra(obsid_list, save_folder="lamost_spectra_uniques", num_workers=50):
+    """
+    Downloads LAMOST spectra by obsid in parallel.
+    
+    :param obsid_list: List of obsids to download
+    :param save_folder: Folder where spectra will be saved
+    :param num_workers: Number of parallel download threads
+    """
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+    else:
+        print(f"📂 Folder '{save_folder}' already exists. Existing files will be deleted")
+        #shutil.rmtree(save_folder)
+        
+
+    # Create a requests Session with Retry to handle transient errors
+    retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+
+    # Use ThreadPoolExecutor to download in parallel
+    results = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_obsid = {
+            executor.submit(download_one_spectrum, obsid, session, save_folder): obsid 
+            for obsid in obsid_list
+        }
+
+        # Wrap with tqdm for progress bar
+        for future in tqdm(as_completed(future_to_obsid), total=len(future_to_obsid), desc="Downloading Spectra"):
+            obsid = future_to_obsid[future]
+            try:
+                obsid, success, error_msg = future.result()
+                results.append((obsid, success, error_msg))
+            except Exception as e:
+                results.append((obsid, False, str(e)))
+
+    # Print any failures
+    failures = [r for r in results if not r[1]]
+    if failures:
+        print(f"❌ Failed to download {len(failures)} spectra:")
+        for (obsid, _, err) in failures[:10]:  # show first 10 errors
+            print(f"  obsid={obsid} => Error: {err}")
+
+    # Return list of successfully downloaded obsids for reference
+    downloaded_obsids = [r[0] for r in results if r[1]]
+    return downloaded_obsids
