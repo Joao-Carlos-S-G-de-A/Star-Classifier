@@ -6173,3 +6173,87 @@ def download_lamost_spectra(obsid_list, save_folder="lamost_spectra_uniques", nu
     # Return list of successfully downloaded obsids for reference
     downloaded_obsids = [r[0] for r in results if r[1]]
     return downloaded_obsids
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score
+
+def calculate_precision_per_class(true_labels, predicted_labels):
+    """
+    Calculates the precision for each class.
+    """
+    precisions = []
+    for i in range(true_labels.shape[1]):
+        true_positives = np.sum((true_labels[:, i] == 1) & (predicted_labels[:, i] == 1))
+        false_positives = np.sum((true_labels[:, i] == 0) & (predicted_labels[:, i] == 1))
+
+        if true_positives + false_positives == 0:
+            precision = 0  # Avoid division by zero
+        else:
+            precision = true_positives / (true_positives + false_positives)
+
+        precisions.append(precision)
+    return precisions
+
+def calculate_f1_score_per_class(true_labels, predicted_labels):
+    """Calculate the F1 score for each class."""
+    f1_scores = []
+    for i in range(true_labels.shape[1]):
+        f1 = f1_score(true_labels[:, i], predicted_labels[:, i])
+        f1_scores.append(f1)
+    return f1_scores
+
+def calculate_sample_size_per_class(true_labels):
+    """Calculates the sample size for each class."""
+    return np.sum(true_labels, axis=0)
+
+def plot_metrics_per_class(true_labels, predicted_labels, class_names, log_scale=False):
+    """
+    Plots precision and F1 score against sample size for each class.
+    """
+    sample_sizes = calculate_sample_size_per_class(true_labels)
+    precisions = calculate_precision_per_class(true_labels, predicted_labels)
+    f1_scores = calculate_f1_score_per_class(true_labels, predicted_labels)
+
+    if log_scale:
+        sample_sizes = np.log10(sample_sizes + 1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+    # Precision plot
+    axes[0].scatter(sample_sizes, precisions, color='steelblue', s=100, edgecolors='k', alpha=0.7)
+    for i, class_name in enumerate(class_names):
+        axes[0].text(sample_sizes[i], precisions[i], class_name, fontsize=9, ha='right')
+
+    axes[0].set_xlabel('Sample Size (Total Number of Samples)')
+    axes[0].set_ylabel('Precision (Correct Guesses / Total Predictions)')
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+    axes[0].set_xlim(0, np.max(sample_sizes) * 1.05)
+    axes[0].set_ylim(-0.0, 1.0)
+    axes[0].set_title("Sample Size vs Precision")
+
+    # F1 Score plot
+    axes[1].scatter(sample_sizes, f1_scores, color='steelblue', s=100, edgecolors='k', alpha=0.7)
+    for i, class_name in enumerate(class_names):
+        axes[1].text(sample_sizes[i], f1_scores[i], class_name, fontsize=9, ha='right')
+
+    axes[1].set_xlabel('Sample Size (Total Number of Samples)')
+    axes[1].set_ylabel('F1 Score (2 * Precision * Recall / Precision + Recall)')
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+    axes[1].set_xlim(0, np.max(sample_sizes) * 1.05)
+    axes[1].set_ylim(-0.0, 1.0)
+    axes[1].set_title("Sample Size vs F1 Score")
+
+    plt.tight_layout()
+    plt.show()
+
+# Load saved predictions
+y_cpu = np.load("Results/mamba_fused_v3_y_cpu.npy")
+predicted_cpu = np.load("Results/mamba_fused_v3_predicted_cpu.npy")
+
+# Load class names
+import pandas as pd
+classes = pd.read_pickle("Pickles/Updated_List_of_Classes_ubuntu.pkl")
+
+# Plot the results
+plot_metrics_per_class(y_cpu, predicted_cpu, classes, log_scale=False)
