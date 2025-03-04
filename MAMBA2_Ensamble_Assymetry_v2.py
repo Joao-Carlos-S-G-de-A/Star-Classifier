@@ -241,7 +241,7 @@ class EnsembleModelWithUncertainty:
         model_params, 
         num_models=5,
         device='cuda',
-        uncertainty_method='variance'
+        uncertainty_method='entropy'
     ):
         """
         Initialize ensemble of models.
@@ -833,18 +833,24 @@ class EnsembleModelWithUncertainty:
             uncertainty['mean_disagreement'] = disagreement.mean(dim=1)
             
         elif self.uncertainty_method == 'entropy':
-            # Entropy of mean predictions
-            epsilon = 1e-10  # Prevent log(0)
-            entropy = -mean_probs * torch.log(mean_probs + epsilon) - (1 - mean_probs) * torch.log(1 - mean_probs + epsilon)
+            # Mean probabilities across models
+            mean_probs = all_probs.mean(dim=0)
+            
+            # Calculate entropy (with small epsilon to avoid log(0))
+            epsilon = 1e-10
+            mean_probs = torch.clamp(mean_probs, epsilon, 1-epsilon)
+            entropy = -mean_probs * torch.log(mean_probs) - (1-mean_probs) * torch.log(1-mean_probs)
+            
+            # Store entropy metrics
             uncertainty['entropy'] = entropy
             uncertainty['mean_entropy'] = entropy.mean(dim=1)
-            
         # Return predictions and uncertainty
         return predictions, uncertainty
     
     def save_ensemble(self, directory):
         """Save all models in the ensemble."""
-        os.makedirs(directory, exist_ok=True)
+        if not os.path.exists(directory): # Accumulate the models in the ensemble and save them on the same dir
+            os.makedirs(directory)
         
         for i, model in enumerate(self.models):
             torch.save(model.state_dict(), os.path.join(directory, f"model_{i}.pth"))
@@ -2000,16 +2006,16 @@ MEMORY_EFFICIENT_CONFIGS = {
     # Maximum spectral dimension with small Gaia dimension
     "max_spectral": {
         "d_model_spectra": 3072,  # Already divisible by 8
-        "d_model_gaia": 256,      # Already divisible by 8
+        "d_model_gaia": 512,      # Already divisible by 8
         "num_classes": 55,
         "input_dim_spectra": 3647,
         "input_dim_gaia": 18,
         "n_layers": 12,
-        "d_state": 16,
+        "d_state": 32,
         "d_conv": 4,
         "expand": 2,
         "use_cross_attention": True,
-        "n_cross_attn_heads": 4
+        "n_cross_attn_heads": 8
     },
     
     # Balanced dimensions for better cross-modal learning
@@ -2035,7 +2041,7 @@ MEMORY_EFFICIENT_CONFIGS = {
         "input_dim_spectra": 3647,
         "input_dim_gaia": 18,
         "n_layers": 8,
-        "d_state": 16,            # Increased from 8 to 16 (divisible by 8)
+        "d_state": 16,            
         "d_conv": 4,              # Increased from 2 to 4
         "expand": 2,              # Increased from 1 to 2
         "use_cross_attention": True,
@@ -2222,7 +2228,7 @@ if __name__ == "__main__":
             model_params=model_params,
             num_models=ensemble_size,
             device=device,
-            uncertainty_method='variance'
+            uncertainty_method='entropy'
         )
         
         # Train the ensemble
@@ -2232,8 +2238,8 @@ if __name__ == "__main__":
             val_loader=val_loader,
             test_loader=test_loader,
             num_epochs=600,
-            lr=1e-4,
-            max_patience=20,
+            lr=3e-5,
+            max_patience=50,
             batch_accumulation=4,
             use_wandb=True,
             wandb_project="star-classifier",
@@ -2250,55 +2256,65 @@ if __name__ == "__main__":
         # Initialize a new wandb run specifically for uncertainty analysis
         wandb.init(project="star-classifier", name="uncertainty_analysis", group="ensemble")
         
-        # Test uncertainty quantification
+        # Fix the uncertainty testing code to handle both uncertainty methods
         print("\nTesting uncertainty quantification on validation data...")
         val_uncertainties = []
         val_predictions = []
         val_labels = []
-        
+
         # Process validation set in batches
         for X_spc, X_ga, y_batch in val_loader:
             # Get predictions and uncertainty metrics
             preds, uncertainty = ensemble.predict(X_spc, X_ga, return_uncertainty=True)
             
-            # Store predictions, uncertainties, and labels
+            # Store predictions and labels
             val_predictions.extend(preds.cpu().numpy())
             val_labels.extend(y_batch.cpu().numpy())
             
-            # Store mean uncertainty for each sample
-            val_uncertainties.extend(uncertainty['mean_std'].cpu().numpy())
-        
+            # Store mean uncertainty for each sample - select appropriate key based on method
+            if ensemble.uncertainty_method == 'entropy':
+                # Using the entropy-based uncertainty
+                val_uncertainties.extend(uncertainty['mean_entropy'].cpu().numpy())
+            elif ensemble.uncertainty_method == 'variance':
+                # Using the variance-based uncertainty
+                val_uncertainties.extend(uncertainty['mean_std'].cpu().numpy())
+            else:
+                # Fallback to any available uncertainty metric
+                key = next(iter(k for k in uncertainty.keys() if k.startswith('mean_')))
+                val_uncertainties.extend(uncertainty[key].cpu().numpy())
+
         # Convert to numpy arrays
         val_uncertainties = np.array(val_uncertainties)
         val_predictions = np.array(val_predictions)
         val_labels = np.array(val_labels)
-        
+
         # Analyze relationship between uncertainty and prediction error
         prediction_errors = np.abs(val_predictions - val_labels).mean(axis=1)
-        
+
         # Calculate correlation between uncertainty and error
         correlation = np.corrcoef(val_uncertainties, prediction_errors)[0, 1]
         print(f"Correlation between uncertainty and prediction error: {correlation:.4f}")
-        
+
         # Log to wandb
+        uncertainty_metric_name = 'mean_entropy' if ensemble.uncertainty_method == 'entropy' else 'mean_std'
         wandb.log({
             "uncertainty_error_correlation": correlation,
             "mean_uncertainty": np.mean(val_uncertainties),
             "max_uncertainty": np.max(val_uncertainties),
             "min_uncertainty": np.min(val_uncertainties)
         })
-        
+
         # Create a scatter plot of uncertainty vs error
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.scatter(val_uncertainties, prediction_errors, alpha=0.5)
-        ax.set_xlabel('Prediction Uncertainty (Std)')
+        ax.set_xlabel(f'Prediction Uncertainty ({uncertainty_metric_name})')
         ax.set_ylabel('Prediction Error')
         ax.set_title(f'Uncertainty vs Error (Correlation: {correlation:.4f})')
         plt.tight_layout()
-        
+
         # Log figure to wandb
         wandb.log({"uncertainty_vs_error": wandb.Image(fig)})
-        
+
         # Close wandb
         wandb.finish()
         
