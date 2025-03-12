@@ -6257,3 +6257,197 @@ classes = pd.read_pickle("Pickles/Updated_List_of_Classes_ubuntu.pkl")
 
 # Plot the results
 plot_metrics_per_class(y_cpu, predicted_cpu, classes, log_scale=False)
+
+
+    def _train_single_model(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        num_epochs=100,
+        lr=2.5e-3,
+        max_patience=20,
+        batch_accumulation=1,
+        model_idx=0
+    ):
+        """Train a single model in the ensemble."""
+        device = self.device
+        model = model.to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
+        
+        # Calculate effective steps for OneCycleLR
+        effective_steps = len(train_loader) // batch_accumulation
+        if len(train_loader) % batch_accumulation != 0:
+            effective_steps += 1
+        
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=lr,
+            epochs=num_epochs,
+            steps_per_epoch=effective_steps
+        )
+        
+        # Calculate class weights
+        all_labels = []
+        for _, _, y_batch in train_loader:
+            all_labels.extend(y_batch.cpu().numpy())
+        
+        class_weights = calculate_class_weights(np.array(all_labels))
+        class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
+        
+        best_val_loss = float('inf')
+        patience = max_patience
+        best_model = None
+        best_metrics = {}
+        
+        for epoch in range(num_epochs):
+            # Resample training data
+            train_loader.dataset.re_sample()
+            
+            # Training with gradient accumulation
+            model.train()
+            train_loss, train_acc = 0.0, 0.0
+            batch_count = 0
+            optimizer.zero_grad()  # Zero gradients at start of epoch
+            
+            for i, (X_spc, X_ga, y_batch) in enumerate(train_loader):
+                X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
+                
+                # Forward pass
+                outputs = model(X_spc, X_ga)
+                loss = criterion(outputs, y_batch) / batch_accumulation  # Scale loss
+                
+                # Backward pass
+                loss.backward()
+                
+                # Update metrics
+                train_loss += loss.item() * batch_accumulation * X_spc.size(0)
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                correct = (predicted == y_batch).float()
+                train_acc += correct.mean(dim=1).mean().item() * X_spc.size(0)
+                batch_count += X_spc.size(0)
+                
+                # Step optimizer and scheduler only after accumulating gradients
+                if (i + 1) % batch_accumulation == 0 or (i + 1) == len(train_loader):
+                    optimizer.step()
+                    scheduler.step()  # Safe because steps_per_epoch is fixed
+                    optimizer.zero_grad()
+            
+            # Calculate average metrics
+            train_loss /= batch_count
+            train_acc /= batch_count
+            
+            # Validation
+            model.eval()
+            val_loss, val_acc = 0.0, 0.0
+            batch_count = 0
+            
+            with torch.no_grad():
+                for X_spc, X_ga, y_batch in val_loader:
+                    X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
+                    
+                    outputs = model(X_spc, X_ga)
+                    loss = criterion(outputs, y_batch)
+                    
+                    val_loss += loss.item() * X_spc.size(0)
+                    predicted = (torch.sigmoid(outputs) > 0.5).float()
+                    correct = (predicted == y_batch).float()
+                    val_acc += correct.mean(dim=1).mean().item() * X_spc.size(0)
+                    batch_count += X_spc.size(0)
+            
+            val_loss /= batch_count
+            val_acc /= batch_count
+            
+            # Print progress
+            #print(f'Model {model_idx+1} - Epoch {epoch+1}/{num_epochs} - 'f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, 'f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}')
+            
+            # Log to wandb
+            if wandb.run is not None:
+                wandb.log({
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_acc": train_acc,
+                    "val_acc": val_acc,
+                    "learning_rate": optimizer.param_groups[0]['lr'],
+                    "hamming_loss": hamming_loss(np.array(all_labels), np.array(all_preds)),
+                    "precision": precision_score(np.array(all_labels), np.array(all_preds), average='samples'),
+                    "recall": recall_score(np.array(all_labels), np.array(all_preds), average='samples'),
+                    "f1": f1_score(np.array(all_labels), np.array(all_preds), average='samples'),
+                    "macro_f1": f1_score(np.array(all_labels), np.array(all_preds), average='macro'),
+                    "micro_f1": f1_score(np.array(all_labels), np.array(all_preds), average='micro'),
+                    "macro_precision": precision_score(np.array(all_labels), np.array(all_preds), average='macro'),
+                    "micro_precision": precision_score(np.array(all_labels), np.array(all_preds), average='micro'),
+                    "macro_recall": recall_score(np.array(all_labels), np.array(all_preds), average='macro'),
+                    "micro_recall": recall_score(np.array(all_labels), np.array(all_preds), average='micro')
+                })
+            
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience = max_patience
+                best_model = model.state_dict().copy()
+                #print(f"New best model with validation loss: {val_loss:.4f}")
+            else:
+                patience -= 1
+                if patience == 0:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+        
+        # Load best model and evaluate on test set
+        model.load_state_dict(best_model)
+        model.eval()
+        
+        # Test evaluation
+        test_loss, test_acc = 0.0, 0.0
+        all_preds, all_labels = [], []
+        batch_count = 0
+        
+        with torch.no_grad():
+            for X_spc, X_ga, y_batch in test_loader:
+                X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
+                
+                outputs = model(X_spc, X_ga)
+                loss = criterion(outputs, y_batch)
+                
+                test_loss += loss.item() * X_spc.size(0)
+                probs = torch.sigmoid(outputs)
+                predicted = (probs > 0.5).float()
+                correct = (predicted == y_batch).float()
+                test_acc += correct.mean(dim=1).mean().item() * X_spc.size(0)
+                
+                batch_count += X_spc.size(0)
+                
+                # Collect predictions and labels for metrics
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(y_batch.cpu().numpy())
+        
+        test_loss /= batch_count
+        test_acc /= batch_count
+        
+        # Calculate detailed metrics
+        metrics = calculate_metrics(np.array(all_labels), np.array(all_preds))
+        
+        print(f"\nModel {model_idx+1} Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+        print("Test Metrics:")
+        for metric, value in metrics.items():
+            print(f"  {metric}: {value:.4f}")
+        
+        # Store metrics for ensemble calculation
+        best_metrics = {
+            "model_idx": model_idx,
+            "test_loss": test_loss,
+            "test_acc": test_acc,
+            **metrics
+        }
+        
+        # Log final test metrics to wandb
+        if wandb.run is not None:
+            wandb.log({
+                "test_loss": test_loss,
+                "test_acc": test_acc,
+                **metrics
+            })
+        
+        return model, best_metrics

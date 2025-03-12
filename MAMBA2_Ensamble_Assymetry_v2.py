@@ -370,198 +370,7 @@ class EnsembleModelWithUncertainty:
         
         return self.models
     
-    def _train_single_model(
-        self,
-        model,
-        train_loader,
-        val_loader,
-        test_loader,
-        num_epochs=100,
-        lr=2.5e-3,
-        max_patience=20,
-        batch_accumulation=1,
-        model_idx=0
-    ):
-        """Train a single model in the ensemble."""
-        device = self.device
-        model = model.to(device)
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
-        
-        # Calculate effective steps for OneCycleLR
-        effective_steps = len(train_loader) // batch_accumulation
-        if len(train_loader) % batch_accumulation != 0:
-            effective_steps += 1
-        
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=lr,
-            epochs=num_epochs,
-            steps_per_epoch=effective_steps
-        )
-        
-        # Calculate class weights
-        all_labels = []
-        for _, _, y_batch in train_loader:
-            all_labels.extend(y_batch.cpu().numpy())
-        
-        class_weights = calculate_class_weights(np.array(all_labels))
-        class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
-        
-        best_val_loss = float('inf')
-        patience = max_patience
-        best_model = None
-        best_metrics = {}
-        
-        for epoch in range(num_epochs):
-            # Resample training data
-            train_loader.dataset.re_sample()
-            
-            # Training with gradient accumulation
-            model.train()
-            train_loss, train_acc = 0.0, 0.0
-            batch_count = 0
-            optimizer.zero_grad()  # Zero gradients at start of epoch
-            
-            for i, (X_spc, X_ga, y_batch) in enumerate(train_loader):
-                X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
-                
-                # Forward pass
-                outputs = model(X_spc, X_ga)
-                loss = criterion(outputs, y_batch) / batch_accumulation  # Scale loss
-                
-                # Backward pass
-                loss.backward()
-                
-                # Update metrics
-                train_loss += loss.item() * batch_accumulation * X_spc.size(0)
-                predicted = (torch.sigmoid(outputs) > 0.5).float()
-                correct = (predicted == y_batch).float()
-                train_acc += correct.mean(dim=1).mean().item() * X_spc.size(0)
-                batch_count += X_spc.size(0)
-                
-                # Step optimizer and scheduler only after accumulating gradients
-                if (i + 1) % batch_accumulation == 0 or (i + 1) == len(train_loader):
-                    optimizer.step()
-                    scheduler.step()  # Safe because steps_per_epoch is fixed
-                    optimizer.zero_grad()
-            
-            # Calculate average metrics
-            train_loss /= batch_count
-            train_acc /= batch_count
-            
-            # Validation
-            model.eval()
-            val_loss, val_acc = 0.0, 0.0
-            batch_count = 0
-            
-            with torch.no_grad():
-                for X_spc, X_ga, y_batch in val_loader:
-                    X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
-                    
-                    outputs = model(X_spc, X_ga)
-                    loss = criterion(outputs, y_batch)
-                    
-                    val_loss += loss.item() * X_spc.size(0)
-                    predicted = (torch.sigmoid(outputs) > 0.5).float()
-                    correct = (predicted == y_batch).float()
-                    val_acc += correct.mean(dim=1).mean().item() * X_spc.size(0)
-                    batch_count += X_spc.size(0)
-            
-            val_loss /= batch_count
-            val_acc /= batch_count
-            
-            # Print progress
-            #print(f'Model {model_idx+1} - Epoch {epoch+1}/{num_epochs} - 'f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, 'f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}')
-            
-            # Log to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "train_acc": train_acc,
-                    "val_acc": val_acc,
-                    "learning_rate": optimizer.param_groups[0]['lr'],
-                    "hamming_loss": hamming_loss(np.array(all_labels), np.array(all_preds)),
-                    "precision": precision_score(np.array(all_labels), np.array(all_preds), average='samples'),
-                    "recall": recall_score(np.array(all_labels), np.array(all_preds), average='samples'),
-                    "f1": f1_score(np.array(all_labels), np.array(all_preds), average='samples'),
-                    "macro_f1": f1_score(np.array(all_labels), np.array(all_preds), average='macro'),
-                    "micro_f1": f1_score(np.array(all_labels), np.array(all_preds), average='micro'),
-                    "macro_precision": precision_score(np.array(all_labels), np.array(all_preds), average='macro'),
-                    "micro_precision": precision_score(np.array(all_labels), np.array(all_preds), average='micro'),
-                    "macro_recall": recall_score(np.array(all_labels), np.array(all_preds), average='macro'),
-                    "micro_recall": recall_score(np.array(all_labels), np.array(all_preds), average='micro')
-                })
-            
-            # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience = max_patience
-                best_model = model.state_dict().copy()
-                #print(f"New best model with validation loss: {val_loss:.4f}")
-            else:
-                patience -= 1
-                if patience == 0:
-                    print(f"Early stopping at epoch {epoch+1}")
-                    break
-        
-        # Load best model and evaluate on test set
-        model.load_state_dict(best_model)
-        model.eval()
-        
-        # Test evaluation
-        test_loss, test_acc = 0.0, 0.0
-        all_preds, all_labels = [], []
-        batch_count = 0
-        
-        with torch.no_grad():
-            for X_spc, X_ga, y_batch in test_loader:
-                X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
-                
-                outputs = model(X_spc, X_ga)
-                loss = criterion(outputs, y_batch)
-                
-                test_loss += loss.item() * X_spc.size(0)
-                probs = torch.sigmoid(outputs)
-                predicted = (probs > 0.5).float()
-                correct = (predicted == y_batch).float()
-                test_acc += correct.mean(dim=1).mean().item() * X_spc.size(0)
-                
-                batch_count += X_spc.size(0)
-                
-                # Collect predictions and labels for metrics
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(y_batch.cpu().numpy())
-        
-        test_loss /= batch_count
-        test_acc /= batch_count
-        
-        # Calculate detailed metrics
-        metrics = calculate_metrics(np.array(all_labels), np.array(all_preds))
-        
-        print(f"\nModel {model_idx+1} Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
-        print("Test Metrics:")
-        for metric, value in metrics.items():
-            print(f"  {metric}: {value:.4f}")
-        
-        # Store metrics for ensemble calculation
-        best_metrics = {
-            "model_idx": model_idx,
-            "test_loss": test_loss,
-            "test_acc": test_acc,
-            **metrics
-        }
-        
-        # Log final test metrics to wandb
-        if wandb.run is not None:
-            wandb.log({
-                "test_loss": test_loss,
-                "test_acc": test_acc,
-                **metrics
-            })
-        
-        return model, best_metrics
+
     
     def _train_single_model(
         self,
@@ -1111,7 +920,7 @@ class AsymmetricMemoryEfficientStarClassifier(nn.Module):
         expand=2,
         use_checkpoint=True,
         activation_checkpointing=True,
-        use_half_precision=True,
+        use_half_precision=False,
         sequential_processing=True
     ):
         super().__init__()
@@ -2005,13 +1814,13 @@ def train_model_fusion_with_wandb(
 MEMORY_EFFICIENT_CONFIGS = {
     # Maximum spectral dimension with small Gaia dimension
     "max_spectral": {
-        "d_model_spectra": 3072,  # Already divisible by 8
-        "d_model_gaia": 512,      # Already divisible by 8
+        "d_model_spectra": 2048,  # Already divisible by 8
+        "d_model_gaia": 256,      # Already divisible by 8
         "num_classes": 55,
         "input_dim_spectra": 3647,
         "input_dim_gaia": 18,
         "n_layers": 12,
-        "d_state": 32,
+        "d_state": 16,
         "d_conv": 4,
         "expand": 2,
         "use_cross_attention": True,
@@ -2051,7 +1860,7 @@ MEMORY_EFFICIENT_CONFIGS = {
     # Ultra small model for compatibility
     "minimal": {
         "d_model_spectra": 512,   # Small but divisible by 8
-        "d_model_gaia": 128,      # Small but divisible by 8
+        "d_model_gaia": 512,      # Small but divisible by 8
         "num_classes": 55,
         "input_dim_spectra": 3647,
         "input_dim_gaia": 18,
@@ -2072,9 +1881,9 @@ if __name__ == "__main__":
     np.random.seed(42)
     
     # Set batch size and batch accumulation
-    batch_size = 128
-    batch_limit = int(batch_size / 2.5)
-    batch_accumulation = 4  # Accumulate gradients over 4 batches
+    batch_size = 4096 # regular is 128
+    batch_limit = int(batch_size / 5)
+    batch_accumulation = 1  # Accumulate gradients over 4 batches
     
     # Load datasets
     print("Loading datasets...")
@@ -2113,9 +1922,9 @@ if __name__ == "__main__":
         
         # Check for NaNs and infs
         print("NaN counts in Gaia training data:")
-        print(X_train_gaia.isnull().sum())
+        print(X_train_gaia.isnull().sum().sum())
         print("Inf counts in Gaia training data:")
-        print(X_train_gaia.isin([np.inf, -np.inf]).sum())
+        print(X_train_gaia.isin([np.inf, -np.inf]).sum().sum())
         
         # Free up memory
         del X_train_full, X_test_full
@@ -2194,8 +2003,9 @@ if __name__ == "__main__":
             config = MEMORY_EFFICIENT_CONFIGS["minimal"]
             print("CUDA not available. Using 'minimal' configuration")
 
-        config = MEMORY_EFFICIENT_CONFIGS["low_memory"]
-        print("Using 'low_memory' configuration for testing")        
+        config = MEMORY_EFFICIENT_CONFIGS["minimal"]
+        print("Using 'low_memory' configuration for testing")    
+
         # Create model parameters dictionary
         model_params = {
             "d_model_spectra": config["d_model_spectra"],
@@ -2222,7 +2032,7 @@ if __name__ == "__main__":
         wandb.init(project="star-classifier", name="ensemble_training")
         
         # Create and train ensemble model
-        ensemble_size = 10  # Can be adjusted based on available resources
+        ensemble_size = 3  # Can be adjusted based on available resources
         ensemble = EnsembleModelWithUncertainty(
             model_class=AsymmetricMemoryEfficientStarClassifier,
             model_params=model_params,
@@ -2240,7 +2050,7 @@ if __name__ == "__main__":
             num_epochs=600,
             lr=3e-5,
             max_patience=50,
-            batch_accumulation=4,
+            batch_accumulation=batch_accumulation,
             use_wandb=True,
             wandb_project="star-classifier",
             wandb_config={
@@ -2251,7 +2061,7 @@ if __name__ == "__main__":
         )
         
         # Save the ensemble
-        ensemble.save_ensemble("ensemble_models")
+        ensemble.save_ensemble("ensemble_model_v2")
 
         # Initialize a new wandb run specifically for uncertainty analysis
         wandb.init(project="star-classifier", name="uncertainty_analysis", group="ensemble")

@@ -617,6 +617,249 @@ def analyze_ensemble_predictions(models, test_loader, class_names, device='cuda'
         print(f"Correlation between uncertainty and error: {correlation:.4f}")
     
     return results_df
+
+
+def diagnose_model_precision(model):
+    """
+    Thoroughly check all parameters and buffers in the model for mixed precision.
+    Returns a dictionary with lists of parameters/buffers of each precision type.
+    """
+    results = {
+        'half_params': [],
+        'float_params': [],
+        'other_params': [],
+        'half_buffers': [],
+        'float_buffers': [],
+        'other_buffers': []
+    }
+    
+    # Check parameters
+    for name, param in model.named_parameters():
+        if param.dtype == torch.float16:
+            results['half_params'].append(name)
+        elif param.dtype == torch.float32:
+            results['float_params'].append(name)
+        else:
+            results['other_params'].append((name, str(param.dtype)))
+    
+    # Check buffers
+    for name, buffer in model.named_buffers():
+        if buffer.dtype == torch.float16:
+            results['half_buffers'].append(name)
+        elif buffer.dtype == torch.float32:
+            results['float_buffers'].append(name)
+        elif torch.is_floating_point(buffer) and buffer.dtype != torch.float32:
+            # Only include non-int buffers in "other"
+            results['other_buffers'].append((name, str(buffer.dtype)))
+    
+    # Print summary
+    print(f"Parameters in half precision (float16): {len(results['half_params'])}")
+    if results['half_params']:
+        print("  First 5 half precision parameters:")
+        for name in results['half_params'][:5]:
+            print(f"  - {name}")
+    
+    print(f"Parameters in full precision (float32): {len(results['float_params'])}")
+    
+    if results['other_params']:
+        print("Parameters in other dtypes:")
+        for name, dtype in results['other_params']:
+            print(f"  - {name}: {dtype}")
+    
+    print(f"Buffers in half precision (float16): {len(results['half_buffers'])}")
+    if results['half_buffers']:
+        print("  Half precision buffers:")
+        for name in results['half_buffers']:
+            print(f"  - {name}")
+    
+    print(f"Buffers in full precision (float32): {len(results['float_buffers'])}")
+    
+    if results['other_buffers']:
+        print("Buffers in other floating point dtypes:")
+        for name, dtype in results['other_buffers']:
+            print(f"  - {name}: {dtype}")
+    
+    return results
+
+
+def fix_model_precision(model, target_dtype=torch.float32):
+    """
+    Recursively convert all parameters and buffers in the model to target_dtype.
+    
+    This is more thorough than just calling .to(dtype=target_dtype) as it will
+    handle nested modules and ensure everything is properly converted.
+    """
+    # First, diagnose the model
+    print("Before conversion:")
+    before = diagnose_model_precision(model)
+    
+    # Convert all parameters in all modules (including nested ones)
+    for module in model.modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if param.dtype != target_dtype and torch.is_floating_point(param):
+                param.data = param.data.to(target_dtype)
+                print(f"Converted parameter: {param_name} from {param.dtype} to {target_dtype}")
+        
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            if buffer.dtype != target_dtype and torch.is_floating_point(buffer):
+                buffer.data = buffer.data.to(target_dtype)
+                print(f"Converted buffer: {buffer_name} from {buffer.dtype} to {target_dtype}")
+    
+    # Check after conversion
+    print("\nAfter conversion:")
+    after = diagnose_model_precision(model)
+    
+    # Verify all parameters and buffers are now in the target dtype
+    all_converted = (len(after['half_params']) == 0 and len(after['other_params']) == 0 and 
+                    len(after['half_buffers']) == 0 and len(after['other_buffers']) == 0)
+    
+    print(f"All floating point tensors converted to {target_dtype}: {all_converted}")
+    return model
+
+
+class Float32ModelWrapper(torch.nn.Module):
+    """
+    A wrapper that ensures all inputs and outputs of the model are in float32 precision.
+    This is helpful when dealing with mixed precision issues.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        
+    def forward(self, *args, **kwargs):
+        # Convert all tensor inputs to float32
+        new_args = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and torch.is_floating_point(arg):
+                new_args.append(arg.float())
+            else:
+                new_args.append(arg)
+        
+        new_kwargs = {}
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                new_kwargs[k] = v.float()
+            else:
+                new_kwargs[k] = v
+        
+        # Run the model with float32 inputs
+        result = self.model(*new_args, **new_kwargs)
+        
+        # Convert result to float32 if it's a tensor
+        if isinstance(result, torch.Tensor) and torch.is_floating_point(result):
+            return result.float()
+        elif isinstance(result, tuple):
+            return tuple(r.float() if isinstance(r, torch.Tensor) and torch.is_floating_point(r) else r for r in result)
+        else:
+            return result
+
+
+def analyze_ensemble_predictions_fixed(models, test_loader, class_names, device='cuda', uncertainty_method='entropy'):
+    """
+    Run ensemble prediction with robust precision handling to prevent dtype mismatches.
+    """
+    if not models:
+        print("No models available for prediction.")
+        return None
+    
+    # First, diagnose and fix model precision issues
+    print("Running precision diagnostics on each model...")
+    for i, model in enumerate(models):
+        print(f"\n=== Model {i} ===")
+        diagnose_model_precision(model)
+    
+    # Convert all models to float32
+    print("\nFixing precision issues by converting all models to float32...")
+    for i in range(len(models)):
+        models[i] = fix_model_precision(models[i], torch.float32)
+    
+    # Wrap models to ensure float32 during forward pass
+    print("\nWrapping all models with Float32ModelWrapper...")
+    wrapped_models = []
+    for model in models:
+        wrapped_models.append(Float32ModelWrapper(model))
+    models = wrapped_models
+    
+    print("\nBeginning prediction with fixed models...")
+    results = []
+    
+    with torch.no_grad():
+        for batch_idx, (X_spc, X_ga, y_batch) in enumerate(test_loader):
+            # Move inputs to device with consistent precision
+            X_spc = X_spc.to(device).float()  # Ensure float32
+            X_ga = X_ga.to(device).float()    # Ensure float32
+            y_batch = y_batch.to(device)
+            
+            # Print debug info for first batch only
+            if batch_idx == 0:
+                print(f"Input tensor dtypes: X_spc={X_spc.dtype}, X_ga={X_ga.dtype}")
+            
+            # Get predictions from all models
+            all_probs = []
+            for model_idx, model in enumerate(models):
+                try:
+                    logits = model(X_spc, X_ga)
+                    probs = torch.sigmoid(logits)
+                    all_probs.append(probs)
+                except RuntimeError as e:
+                    print(f"Error in model {model_idx} forward pass: {e}")
+                    # Re-raise the exception
+                    raise
+            
+            # Continue with the rest of your existing code
+            all_probs = torch.stack(all_probs)
+            mean_probs = all_probs.mean(dim=0)
+            uncertainty = calculate_uncertainty(all_probs, method=uncertainty_method)
+            predictions = (mean_probs > 0.5).float()
+            errors = torch.abs(predictions - y_batch)
+            mean_errors = errors.mean(dim=1)
+            
+            # Store results
+            for i in range(X_spc.size(0)):
+                sample_result = {
+                    'sample_id': batch_idx * test_loader.batch_size + i,
+                    'mean_error': mean_errors[i].item(),
+                }
+                
+                # Add uncertainty metrics
+                for key, value in uncertainty.items():
+                    if key.startswith('mean_'):
+                        sample_result[key] = value[i].item()
+                
+                # Add per-class ground truth, predictions, and uncertainties
+                for j, class_name in enumerate(class_names):
+                    sample_result[f'true_{class_name}'] = y_batch[i, j].item()
+                    sample_result[f'pred_{class_name}'] = predictions[i, j].item()
+                    sample_result[f'prob_{class_name}'] = mean_probs[i, j].item()
+                    
+                    if 'entropy' in uncertainty:
+                        sample_result[f'entropy_{class_name}'] = uncertainty['entropy'][i, j].item()
+                    if 'variance' in uncertainty:
+                        sample_result[f'variance_{class_name}'] = uncertainty['variance'][i, j].item()
+                
+                results.append(sample_result)
+            
+            # Print progress
+            if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
+                print(f"Processed {batch_idx + 1} batches")
+    
+    # Convert to DataFrame
+    results_df = pd.DataFrame(results)
+    
+    # Calculate correlation between uncertainty and error
+    if uncertainty_method == 'entropy' and 'mean_entropy' in results_df.columns:
+        correlation = results_df['mean_entropy'].corr(results_df['mean_error'])
+    elif uncertainty_method == 'variance' and 'mean_variance' in results_df.columns:
+        correlation = results_df['mean_variance'].corr(results_df['mean_error'])
+    else:
+        correlation = None
+    
+    if correlation is not None:
+        print(f"Correlation between uncertainty and error: {correlation:.4f}")
+    
+    return results_df
+
+
 # Example usage
 if __name__ == "__main__":
     # This is a template script - you need to fill in the specific model class and parameters
@@ -677,9 +920,9 @@ if __name__ == "__main__":
     
     # Check for NaNs and infs
     print("NaN counts in Gaia training data:")
-    print(X_train_gaia.isnull().sum())
+    print(X_train_gaia.isnull().sum().sum())
     print("Inf counts in Gaia training data:")
-    print(X_train_gaia.isin([np.inf, -np.inf]).sum())
+    print(X_train_gaia.isin([np.inf, -np.inf]).sum().sum())
     
     # Free up memory
     del X_train_full, X_test_full
@@ -733,30 +976,29 @@ if __name__ == "__main__":
     print(f"Train dataset: {len(train_dataset)} samples")
     print(f"Validation dataset: {len(val_dataset)} samples")
     print(f"Test dataset: {len(test_dataset)} samples")
-
     # Create test dataset and dataloader
     test_dataset = MultiModalBalancedMultiLabelDataset(X_test_spectra, X_test_gaia, y_test)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
     
     # Define model parameters - replace with your actual model parameters
     model_params = {
-        "d_model_spectra": 2048,  # Already divisible by 8
-        "d_model_gaia": 256,      # Already divisible by 8
+        "d_model_spectra": 512,  # Already divisible by 8
+        "d_model_gaia": 512,      # Already divisible by 8
         "num_classes": 55,
         "input_dim_spectra": 3647,
         "input_dim_gaia": 18,
-        "n_layers": 8,
+        "n_layers": 4,
         "d_state_spectra": 16,
         "d_state_gaia": 16,
         "d_conv": 4,
         "expand": 2,
         "use_cross_attention": True,
-        "n_cross_attn_heads": 4
+        "n_cross_attn_heads": 2
     }
     
     # Load ensemble models
     models = load_ensemble_models(
-        ensemble_dir="ensemble_models",
+        ensemble_dir="ensemble_model_v2",
         model_class=AsymmetricMemoryEfficientStarClassifier,
         model_params=model_params,
         device=device
@@ -769,7 +1011,7 @@ if __name__ == "__main__":
             break
     
     # Run ensemble prediction and analysis
-    results_df = analyze_ensemble_predictions(
+    results_df = analyze_ensemble_predictions_fixed(
         models=models,
         test_loader=test_loader,
         class_names=class_names,
