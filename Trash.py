@@ -6451,3 +6451,428 @@ plot_metrics_per_class(y_cpu, predicted_cpu, classes, log_scale=False)
             })
         
         return model, best_metrics
+
+import torch
+import torch.nn as nn
+from functools import partial
+
+# Import the needed components from your MambaOut implementation
+from timm.models.layers import DropPath
+
+class GatedCNNBlock(nn.Module):
+    """Adaptation of GatedCNNBlock for sequence data"""
+    def __init__(self, dim, d_state=256, d_conv=4, expand=2, drop_path=0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        hidden = int(expand * dim)
+        self.fc1 = nn.Linear(dim, hidden * 2)
+        self.act = nn.GELU()
+        
+        # Use 1D convolution for sequence data with same padding
+        # Ensure padding is properly set to maintain sequence length
+        padding = (d_conv - 1) // 2  # This ensures 'same' padding for odd kernel sizes
+        self.conv = nn.Conv1d(
+            in_channels=hidden,
+            out_channels=hidden,
+            kernel_size=d_conv,
+            padding=padding,
+            groups=hidden  # Depthwise convolution
+        )
+        
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        # Input shape: [B, seq_len, dim]
+        shortcut = x
+        x = self.norm(x)
+        
+        # Split the channels for gating mechanism
+        x = self.fc1(x)  # [B, seq_len, hidden*2]
+        chunks = torch.chunk(x, 2, dim=-1)  # Creates two tensors
+        g, c = chunks  # Each: [B, seq_len, hidden]
+        
+        # Apply 1D convolution on c (preserving sequence length)
+        batch_size, seq_len, channels = c.shape
+        c_permuted = c.permute(0, 2, 1)  # [B, hidden, seq_len]
+        c_conv = self.conv(c_permuted)  # [B, hidden, seq_len]
+        
+        # Ensure c_conv has the right sequence length
+        if c_conv.shape[2] != seq_len:
+            # If sequence length changed (due to even kernel size)
+            # Either pad or trim to match original sequence length
+            if c_conv.shape[2] < seq_len:
+                # Pad if too short
+                padding = torch.zeros(batch_size, channels, seq_len - c_conv.shape[2], 
+                                      device=c_conv.device)
+                c_conv = torch.cat([c_conv, padding], dim=2)
+            else:
+                # Trim if too long
+                c_conv = c_conv[:, :, :seq_len]
+        
+        c_final = c_conv.permute(0, 2, 1)  # [B, seq_len, hidden]
+        
+        # Gating mechanism
+        x = self.fc2(self.act(g) * c_final)  # [B, seq_len, dim]
+        
+        x = self.drop_path(x)
+        return x + shortcut
+
+class SequenceMambaOut(nn.Module):
+    """Adaptation of MambaOut for sequence data with a single stage"""
+    def __init__(self, d_model, d_state=256, d_conv=4, expand=2, depth=1, drop_path=0.):
+        super().__init__()
+        
+        # Create a sequence of GatedCNNBlocks
+        self.blocks = nn.Sequential(
+            *[GatedCNNBlock(
+                dim=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                drop_path=drop_path
+            ) for _ in range(depth)]
+        )
+    
+    def forward(self, x):
+        return self.blocks(x)
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, dim, n_heads=8):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=n_heads,
+            batch_first=True
+        )
+    
+    def forward(self, x, context):
+        """
+        x: (B, seq_len_x, dim)
+        context: (B, seq_len_context, dim)
+        """
+        x_norm = self.norm(x)
+        attn_output, _ = self.attention(
+            query=x_norm,
+            key=context,
+            value=context
+        )
+        return x + attn_output
+
+class StarClassifierFusion(nn.Module):
+    def __init__(
+        self,
+        d_model_spectra,
+        d_model_gaia,
+        num_classes,
+        input_dim_spectra,
+        input_dim_gaia,
+        n_layers=6,
+        use_cross_attention=True,
+        n_cross_attn_heads=8,
+        d_state=256,
+        d_conv=4,
+        expand=2,
+    ):
+        """
+        Args:
+            d_model_spectra (int): embedding dimension for the spectra MAMBA
+            d_model_gaia (int): embedding dimension for the gaia MAMBA
+            num_classes (int): multi-label classification
+            input_dim_spectra (int): # of features for spectra
+            input_dim_gaia (int): # of features for gaia
+            n_layers (int): depth for each MAMBA
+            use_cross_attention (bool): whether to use cross-attention
+            n_cross_attn_heads (int): number of heads for cross-attention
+        """
+        super().__init__()
+
+        # --- MambaOut for spectra ---
+        self.mamba_spectra = nn.Sequential(
+            *[SequenceMambaOut(
+                d_model=d_model_spectra,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                depth=1,  # Each SequenceMambaOut has depth 1
+                drop_path=0.1 if i > 0 else 0.0,  # Optional: add some dropout for regularization
+            ) for i in range(n_layers)]
+        )
+        self.input_proj_spectra = nn.Linear(input_dim_spectra, d_model_spectra)
+
+        # --- MambaOut for gaia ---
+        self.mamba_gaia = nn.Sequential(
+            *[SequenceMambaOut(
+                d_model=d_model_gaia,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                depth=1,  # Each SequenceMambaOut has depth 1
+                drop_path=0.1 if i > 0 else 0.0,  # Optional: add some dropout for regularization
+            ) for i in range(n_layers)]
+        )
+        self.input_proj_gaia = nn.Linear(input_dim_gaia, d_model_gaia)
+
+        # --- Cross Attention (Optional) ---
+        self.use_cross_attention = use_cross_attention
+        if use_cross_attention:
+            self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
+            self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
+
+        # --- Final Classifier ---
+        fusion_dim = d_model_spectra + d_model_gaia
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, num_classes)
+        )
+    
+    def forward(self, x_spectra, x_gaia):
+        """
+        x_spectra : (batch_size, input_dim_spectra) or (batch_size, seq_len_spectra, input_dim_spectra)
+        x_gaia    : (batch_size, input_dim_gaia) or (batch_size, seq_len_gaia, input_dim_gaia)
+        """
+        # For MambaOut, we expect shape: (B, seq_len, d_model). 
+        # If input is just (B, d_in), we turn it into (B, 1, d_in).
+        
+        # --- Project to d_model and add sequence dimension if needed ---
+        if len(x_spectra.shape) == 2:
+            x_spectra = self.input_proj_spectra(x_spectra)  # (B, d_model_spectra)
+            x_spectra = x_spectra.unsqueeze(1)              # (B, 1, d_model_spectra)
+        else:
+            x_spectra = self.input_proj_spectra(x_spectra)  # (B, seq_len, d_model_spectra)
+        
+        if len(x_gaia.shape) == 2:
+            x_gaia = self.input_proj_gaia(x_gaia)           # (B, d_model_gaia)
+            x_gaia = x_gaia.unsqueeze(1)                    # (B, 1, d_model_gaia)
+        else:
+            x_gaia = self.input_proj_gaia(x_gaia)           # (B, seq_len, d_model_gaia)
+
+        # --- MambaOut encoding (each modality separately) ---
+        x_spectra = self.mamba_spectra(x_spectra)  # (B, seq_len, d_model_spectra)
+        x_gaia = self.mamba_gaia(x_gaia)           # (B, seq_len, d_model_gaia)
+
+        # Optionally, use cross-attention to fuse the representations
+        if self.use_cross_attention:
+            # Cross-attention from spectra -> gaia
+            x_spectra_fused = self.cross_attn_block_spectra(x_spectra, x_gaia)
+            # Cross-attention from gaia -> spectra
+            x_gaia_fused = self.cross_attn_block_gaia(x_gaia, x_spectra)
+            
+            # Update x_spectra and x_gaia
+            x_spectra = x_spectra_fused
+            x_gaia = x_gaia_fused
+        
+        # --- Pool across sequence dimension ---
+        x_spectra = x_spectra.mean(dim=1)  # (B, d_model_spectra)
+        x_gaia = x_gaia.mean(dim=1)        # (B, d_model_gaia)
+
+        # --- Late Fusion by Concatenation ---
+        x_fused = torch.cat([x_spectra, x_gaia], dim=-1)  # (B, d_model_spectra + d_model_gaia)
+
+        # --- Final classification ---
+        logits = self.classifier(x_fused)  # (B, num_classes)
+        return logits
+    
+    import torch
+import torch.nn as nn
+from functools import partial
+
+# Import the needed components from your MambaOut implementation
+from timm.models.layers import DropPath
+
+class GatedCNNBlock(nn.Module):
+    """Adaptation of GatedCNNBlock for sequence data"""
+    def __init__(self, dim, d_state=256, d_conv=4, expand=2, drop_path=0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        hidden = int(expand * dim)
+        self.fc1 = nn.Linear(dim, hidden * 2)
+        self.act = nn.GELU()
+        
+        # Use 1D convolution for sequence data
+        self.conv = nn.Conv1d(
+            in_channels=hidden,
+            out_channels=hidden,
+            kernel_size=d_conv,
+            padding=d_conv // 2,
+            groups=hidden  # Depthwise convolution
+        )
+        
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        # Input shape: [B, seq_len, dim]
+        shortcut = x
+        x = self.norm(x)
+        
+        x = self.fc1(x)  # [B, seq_len, hidden*2]
+        g, c = torch.chunk(x, 2, dim=-1)  # Each: [B, seq_len, hidden]
+        
+        # Apply 1D convolution on c
+        c = c.permute(0, 2, 1)  # [B, hidden, seq_len]
+        c = self.conv(c)  # [B, hidden, seq_len]
+        c = c.permute(0, 2, 1)  # [B, seq_len, hidden]
+        
+        # Gating mechanism
+        x = self.fc2(self.act(g) * c)  # [B, seq_len, dim]
+        
+        x = self.drop_path(x)
+        return x + shortcut
+
+class SequenceMambaOut(nn.Module):
+    """Adaptation of MambaOut for sequence data with a single stage"""
+    def __init__(self, d_model, d_state=256, d_conv=4, expand=2, depth=1, drop_path=0.):
+        super().__init__()
+        
+        # Create a sequence of GatedCNNBlocks
+        self.blocks = nn.Sequential(
+            *[GatedCNNBlock(
+                dim=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                drop_path=drop_path
+            ) for _ in range(depth)]
+        )
+    
+    def forward(self, x):
+        return self.blocks(x)
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, dim, n_heads=8):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=n_heads,
+            batch_first=True
+        )
+    
+    def forward(self, x, context):
+        """
+        x: (B, seq_len_x, dim)
+        context: (B, seq_len_context, dim)
+        """
+        x_norm = self.norm(x)
+        attn_output, _ = self.attention(
+            query=x_norm,
+            key=context,
+            value=context
+        )
+        return x + attn_output
+
+class StarClassifierFusion(nn.Module):
+    def __init__(
+        self,
+        d_model_spectra,
+        d_model_gaia,
+        num_classes,
+        input_dim_spectra,
+        input_dim_gaia,
+        n_layers=6,
+        use_cross_attention=True,
+        n_cross_attn_heads=8,
+        d_state=256,
+        d_conv=4,
+        expand=2,
+    ):
+        """
+        Args:
+            d_model_spectra (int): embedding dimension for the spectra MAMBA
+            d_model_gaia (int): embedding dimension for the gaia MAMBA
+            num_classes (int): multi-label classification
+            input_dim_spectra (int): # of features for spectra
+            input_dim_gaia (int): # of features for gaia
+            n_layers (int): depth for each MAMBA
+            use_cross_attention (bool): whether to use cross-attention
+            n_cross_attn_heads (int): number of heads for cross-attention
+        """
+        super().__init__()
+
+        # --- MambaOut for spectra ---
+        self.mamba_spectra = nn.Sequential(
+            *[SequenceMambaOut(
+                d_model=d_model_spectra,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                depth=1,  # Each SequenceMambaOut has depth 1
+                drop_path=0.1 if i > 0 else 0.0,  # Optional: add some dropout for regularization
+            ) for i in range(n_layers)]
+        )
+        self.input_proj_spectra = nn.Linear(input_dim_spectra, d_model_spectra)
+
+        # --- MambaOut for gaia ---
+        self.mamba_gaia = nn.Sequential(
+            *[SequenceMambaOut(
+                d_model=d_model_gaia,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                depth=1,  # Each SequenceMambaOut has depth 1
+                drop_path=0.1 if i > 0 else 0.0,  # Optional: add some dropout for regularization
+            ) for i in range(n_layers)]
+        )
+        self.input_proj_gaia = nn.Linear(input_dim_gaia, d_model_gaia)
+
+        # --- Cross Attention (Optional) ---
+        self.use_cross_attention = use_cross_attention
+        if use_cross_attention:
+            self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
+            self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
+
+        # --- Final Classifier ---
+        fusion_dim = d_model_spectra + d_model_gaia
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, num_classes)
+        )
+    
+    def forward(self, x_spectra, x_gaia):
+        """
+        x_spectra : (batch_size, input_dim_spectra) or (batch_size, seq_len_spectra, input_dim_spectra)
+        x_gaia    : (batch_size, input_dim_gaia) or (batch_size, seq_len_gaia, input_dim_gaia)
+        """
+        # For MambaOut, we expect shape: (B, seq_len, d_model). 
+        # If input is just (B, d_in), we turn it into (B, 1, d_in).
+        
+        # --- Project to d_model and add sequence dimension if needed ---
+        if len(x_spectra.shape) == 2:
+            x_spectra = self.input_proj_spectra(x_spectra)  # (B, d_model_spectra)
+            x_spectra = x_spectra.unsqueeze(1)              # (B, 1, d_model_spectra)
+        else:
+            x_spectra = self.input_proj_spectra(x_spectra)  # (B, seq_len, d_model_spectra)
+        
+        if len(x_gaia.shape) == 2:
+            x_gaia = self.input_proj_gaia(x_gaia)           # (B, d_model_gaia)
+            x_gaia = x_gaia.unsqueeze(1)                    # (B, 1, d_model_gaia)
+        else:
+            x_gaia = self.input_proj_gaia(x_gaia)           # (B, seq_len, d_model_gaia)
+
+        # --- MambaOut encoding (each modality separately) ---
+        x_spectra = self.mamba_spectra(x_spectra)  # (B, seq_len, d_model_spectra)
+        x_gaia = self.mamba_gaia(x_gaia)           # (B, seq_len, d_model_gaia)
+
+        # Optionally, use cross-attention to fuse the representations
+        if self.use_cross_attention:
+            # Cross-attention from spectra -> gaia
+            x_spectra_fused = self.cross_attn_block_spectra(x_spectra, x_gaia)
+            # Cross-attention from gaia -> spectra
+            x_gaia_fused = self.cross_attn_block_gaia(x_gaia, x_spectra)
+            
+            # Update x_spectra and x_gaia
+            x_spectra = x_spectra_fused
+            x_gaia = x_gaia_fused
+        
+        # --- Pool across sequence dimension ---
+        x_spectra = x_spectra.mean(dim=1)  # (B, d_model_spectra)
+        x_gaia = x_gaia.mean(dim=1)        # (B, d_model_gaia)
+
+        # --- Late Fusion by Concatenation ---
+        x_fused = torch.cat([x_spectra, x_gaia], dim=-1)  # (B, d_model_spectra + d_model_gaia)
+
+        # --- Final classification ---
+        logits = self.classifier(x_fused)  # (B, num_classes)
+        return logits
