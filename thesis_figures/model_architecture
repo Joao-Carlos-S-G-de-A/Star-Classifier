@@ -1,0 +1,64 @@
+// StarClassifierFusion Architecture
+digraph {
+	node [fontname=Arial shape=box style=filled]
+	fontsize=20 label="StarClassifierFusion Neural Network Architecture" labelloc=t
+	subgraph cluster_inputs {
+		color=lightblue fontcolor=black label=Inputs style=filled
+		spectra_input [label="Spectral Input
+(B, 3647)" fillcolor=white]
+		gaia_input [label="Gaia Input
+(B, 18)" fillcolor=white]
+	}
+	spectra_proj [label="Linear Projection
+(B, 2048)" fillcolor="#F8CECC"]
+	gaia_proj [label="Linear Projection
+(B, 2048)" fillcolor="#F8CECC"]
+	spectra_input -> spectra_proj
+	gaia_input -> gaia_proj
+	spectra_reshape [label="Unsqueeze
+(B, 1, 2048)" fillcolor="#D5E8D4"]
+	gaia_reshape [label="Unsqueeze
+(B, 1, 2048)" fillcolor="#D5E8D4"]
+	spectra_proj -> spectra_reshape
+	gaia_proj -> gaia_reshape
+	subgraph cluster_mamba_spectra {
+		color="#DAE8FC" fontcolor=black label="Mamba2 Encoder (Spectra)" style=filled
+		mamba_spectra [label="Mamba2 Layers × 12
+(B, 1, 2048)" fillcolor=white]
+	}
+	subgraph cluster_mamba_gaia {
+		color="#DAE8FC" fontcolor=black label="Mamba2 Encoder (Gaia)" style=filled
+		mamba_gaia [label="Mamba2 Layers × 12
+(B, 1, 2048)" fillcolor=white]
+	}
+	spectra_reshape -> mamba_spectra
+	gaia_reshape -> mamba_gaia
+	subgraph cluster_cross_attn {
+		color="#FFE6CC" fontcolor=black label="Cross-Attention" style=filled
+		cross_attn_spectra [label="Cross-Attention
+(Spectra → Gaia)" fillcolor=white]
+		cross_attn_gaia [label="Cross-Attention
+(Gaia → Spectra)" fillcolor=white]
+	}
+	mamba_spectra -> cross_attn_spectra
+	mamba_gaia -> cross_attn_gaia
+	mamba_gaia -> cross_attn_spectra [color=gray style=dashed]
+	mamba_spectra -> cross_attn_gaia [color=gray style=dashed]
+	pool_spectra [label="Mean Pooling
+(B, 2048)" fillcolor="#D5E8D4"]
+	pool_gaia [label="Mean Pooling
+(B, 2048)" fillcolor="#D5E8D4"]
+	cross_attn_spectra -> pool_spectra
+	cross_attn_gaia -> pool_gaia
+	fusion [label="Concatenation
+(B, 4096)" fillcolor="#FFF2CC"]
+	pool_spectra -> fusion
+	pool_gaia -> fusion
+	layer_norm [label="Layer Normalization" fillcolor="#F8CECC"]
+	classifier [label="Linear Classifier
+(B, 55)" fillcolor="#F8CECC"]
+	output [label="Output Logits" fillcolor="#E1D5E7"]
+	fusion -> layer_norm
+	layer_norm -> classifier
+	classifier -> output
+}
