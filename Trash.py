@@ -6876,3 +6876,123 @@ class StarClassifierFusion(nn.Module):
         # --- Final classification ---
         logits = self.classifier(x_fused)  # (B, num_classes)
         return logits
+    
+    def train_model_fusion(
+    model,
+    train_loader,
+    val_loader,
+    test_loader,
+    num_epochs=100,
+    lr=1e-4,
+    max_patience=20,
+    device='cuda'
+):
+    model = model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=int(max_patience / 5)
+    )
+
+    # We assume the datasets are MultiModalBalancedMultiLabelDataset
+    # that returns (X_spectra, X_gaia, y).
+    # You can keep the class weighting logic as in train_model_mamba.
+    all_labels = []
+    for _, _, y_batch in train_loader:
+        all_labels.extend(y_batch.cpu().numpy())
+    
+    class_weights = calculate_class_weights(np.array(all_labels))
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
+    
+    best_val_loss = float('inf')
+    patience = max_patience
+
+    for epoch in range(num_epochs):
+        # Resample training data
+        train_loader.dataset.re_sample()
+
+        # Recompute class weights if needed
+        all_labels = []
+        for _, _, y_batch in train_loader:
+            all_labels.extend(y_batch.cpu().numpy())
+        class_weights = calculate_class_weights(np.array(all_labels))
+        class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
+
+        # --- Training ---
+        model.train()
+        train_loss, train_acc = 0.0, 0.0
+        for X_spc, X_ga, y_batch in train_loader:
+            X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_spc, X_ga)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * X_spc.size(0)
+            predicted = (torch.sigmoid(outputs) > 0.5).float()
+            correct = (predicted == y_batch).float()
+            train_acc += correct.mean(dim=1).mean().item()
+
+        # --- Validation ---
+        model.eval()
+        val_loss, val_acc = 0.0, 0.0
+        with torch.no_grad():
+            for X_spc, X_ga, y_batch in val_loader:
+                X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
+                outputs = model(X_spc, X_ga)
+                loss = criterion(outputs, y_batch)
+                val_loss += loss.item() * X_spc.size(0)
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                correct = (predicted == y_batch).float()
+                val_acc += correct.mean(dim=1).mean().item()
+
+        # --- Test metrics (optional or do after training) ---
+        test_loss, test_acc = 0.0, 0.0
+        y_true, y_pred = [], []
+        with torch.no_grad():
+            for X_spc, X_ga, y_batch in test_loader:
+                X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
+                outputs = model(X_spc, X_ga)
+                loss = criterion(outputs, y_batch)
+                test_loss += loss.item() * X_spc.size(0)
+                
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                correct = (predicted == y_batch).float()
+                test_acc += correct.mean(dim=1).mean().item()
+
+                y_true.extend(y_batch.cpu().numpy())
+                y_pred.extend(predicted.cpu().numpy())
+
+        # Compute multi-label metrics as before
+        all_metrics = calculate_metrics(np.array(y_true), np.array(y_pred))
+
+        # Logging example
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss / len(train_loader.dataset),
+            "val_loss": val_loss / len(val_loader.dataset),
+            "train_acc": train_acc / len(train_loader),
+            "val_acc": val_acc / len(val_loader),
+            "test_loss": test_loss / len(test_loader.dataset),
+            "test_acc": test_acc / len(test_loader),
+            **all_metrics
+        })
+
+        # Scheduler
+        scheduler.step(val_loss / len(val_loader.dataset))
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience = max_patience
+            best_model = model.state_dict()
+        else:
+            patience -= 1
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+
+    model.load_state_dict(best_model)
+    return model
