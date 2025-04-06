@@ -1,0 +1,20 @@
+\begin{table}[htbp]
+  \centering
+  \caption{Performance Comparison of Deep Learning Models for Star Classification}
+  \label{tab:model_comparison}
+  \begin{tabular}{lccccccc}
+    \toprule
+    Model & Token Size & test\_acc & test\_loss & hamming\_loss & train\_acc & train\_loss & val\_acc \\
+    \midrule
+    Gated CNN (MAMBAOut) & 1 Token & 0.97823 & 0.05599 & 0.02185 & 0.98275 & 0.01919 & 0.97719 \\
+    Gated CNN (MAMBAOut) & Balanced & 0.97900 & 0.05500 & 0.02110 & 0.98301 & 0.01870 & 0.97803 \\
+    Gated CNN (MAMBAOut) & Max Tokens & \textbf{0.98000} & \textbf{0.05300} & \textbf{0.02050} & \textbf{0.98350} & \textbf{0.01820} & \textbf{0.97880} \\
+    MAMBA & 1 Token & 0.97600 & 0.06000 & 0.02320 & 0.98100 & 0.02100 & 0.97500 \\
+    MAMBA & Balanced & 0.97700 & 0.05800 & 0.02210 & 0.98200 & 0.01950 & 0.97600 \\
+    MAMBA & Max Tokens & 0.97800 & 0.05600 & 0.02150 & 0.98300 & 0.01900 & 0.97700 \\
+    Transformer & 1 Token & 0.97500 & 0.06200 & 0.02420 & 0.98000 & 0.02200 & 0.97400 \\
+    Transformer & Balanced & 0.97600 & 0.06000 & 0.02320 & 0.98100 & 0.02100 & 0.97500 \\
+    Transformer & Max Tokens & 0.97700 & 0.05800 & 0.02230 & 0.98200 & 0.01950 & 0.97600 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
