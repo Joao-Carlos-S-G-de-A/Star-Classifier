@@ -723,204 +723,10 @@ def load_model(model_path, input_dim_spectra=3647, input_dim_gaia=18, num_classe
         # Determine model type from filename
         model_type = None
         if 'mamba_' in model_path.lower() or 'mamba.' in model_path.lower():
-            model_type = 'MAMBA'
-        elif 'transformer' in model_path.lower():
-            model_type = 'Transformer'
-        elif 'gated_cnn' in model_path.lower() or 'mambaout' in model_path.lower():
-            model_type = 'MambaOut'
-        else:
-            print(f"Unable to determine model type from filename: {model_path}")
-            return None
-        
-        # Define default model parameters
-        d_model_spectra = 256
-        d_model_gaia = 128
-        
-        # Determine token config from filename
-        if '1_token' in model_path.lower():
-            token_dim_spectra = input_dim_spectra  # All features in one token
-            token_dim_gaia = input_dim_gaia      # All features in one token
-        elif 'balanced' in model_path.lower():
-            token_dim_spectra = 128   # Moderate tokenization
-            token_dim_gaia = 4        # Moderate tokenization
-        else:  # max_tokens
-            token_dim_spectra = 16    # Maximum tokenization
-            token_dim_gaia = 1        # Maximum tokenization
-        
-        print(f"Creating model of type {model_type} with token configuration: spectra={token_dim_spectra}, gaia={token_dim_gaia}")
-        
-        # Create model based on type
-        if model_type == 'MAMBA':
-            # Note: This might fail if the mamba_ssm package is not available
-            try:
-                from mamba_ssm import Mamba2
-                
-                # Define custom Mamba model class here since it requires the imported Mamba2
-                class StarClassifierFusionMambaTokenized(nn.Module):
-                    def __init__(
-                        self,
-                        d_model_spectra,
-                        d_model_gaia,
-                        num_classes,
-                        input_dim_spectra,
-                        input_dim_gaia,
-                        token_dim_spectra=64,  # Size of each token for spectra
-                        token_dim_gaia=2,      # Size of each token for gaia
-                        n_layers=10,
-                        use_cross_attention=True,
-                        n_cross_attn_heads=8,
-                        d_state=256,
-                        d_conv=4,
-                        expand=2,
-                    ):
-                        super().__init__()
-
-                        # --- Feature Tokenizers ---
-                        self.tokenizer_spectra = FeatureTokenizer(
-                            input_dim=input_dim_spectra,
-                            token_dim=token_dim_spectra,
-                            d_model=d_model_spectra
-                        )
-                        
-                        self.tokenizer_gaia = FeatureTokenizer(
-                            input_dim=input_dim_gaia,
-                            token_dim=token_dim_gaia,
-                            d_model=d_model_gaia
-                        )
-
-                        # --- MAMBA 2 for spectra ---
-                        self.mamba_spectra = nn.Sequential(
-                            *[Mamba2(
-                                d_model=d_model_spectra,
-                                d_state=d_state,
-                                d_conv=d_conv,
-                                expand=expand,
-                            ) for _ in range(n_layers)]
-                        )
-
-                        # --- MAMBA 2 for gaia ---
-                        self.mamba_gaia = nn.Sequential(
-                            *[Mamba2(
-                                d_model=d_model_gaia,
-                                d_state=d_state,
-                                d_conv=d_conv,
-                                expand=expand,
-                            ) for _ in range(n_layers)]
-                        )
-
-                        # --- Cross Attention (Optional) ---
-                        self.use_cross_attention = use_cross_attention
-                        if use_cross_attention:
-                            self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
-                            self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
-
-                        # --- Final Classifier ---
-                        fusion_dim = d_model_spectra + d_model_gaia
-                        self.classifier = nn.Sequential(
-                            nn.LayerNorm(fusion_dim),
-                            nn.Linear(fusion_dim, num_classes)
-                        )
-                    
-                    def forward(self, x_spectra, x_gaia):
-                        # Tokenize input features
-                        x_spectra_tokens = self.tokenizer_spectra(x_spectra)
-                        x_gaia_tokens = self.tokenizer_gaia(x_gaia)
-                        
-                        # Process through Mamba models
-                        x_spectra = self.mamba_spectra(x_spectra_tokens)
-                        x_gaia = self.mamba_gaia(x_gaia_tokens)          
-
-                        # Optional cross-attention
-                        if self.use_cross_attention:
-                            x_spectra = self.cross_attn_block_spectra(x_spectra, x_gaia)
-                            x_gaia = self.cross_attn_block_gaia(x_gaia, x_spectra)
-                        
-                        # Global pooling over sequence dimension
-                        x_spectra = x_spectra.mean(dim=1)  # [batch_size, d_model]
-                        x_gaia = x_gaia.mean(dim=1)        # [batch_size, d_model]
-
-                        # Concatenate for fusion
-                        x_fused = torch.cat([x_spectra, x_gaia], dim=-1)  # [batch_size, 2*d_model]
-
-                        # Final classification
-                        logits = self.classifier(x_fused)  # [batch_size, num_classes]
-                        
-                        return logits
-                
-                model = StarClassifierFusionMambaTokenized(
-                    d_model_spectra=d_model_spectra,
-                    d_model_gaia=d_model_gaia,
-                    num_classes=num_classes,
-                    input_dim_spectra=input_dim_spectra,
-                    input_dim_gaia=input_dim_gaia,
-                    token_dim_spectra=token_dim_spectra,
-                    token_dim_gaia=token_dim_gaia
-                )
-            except ImportError:
-                print("Mamba2 module not found. Using MambaOut model as a fallback.")
-                model_type = 'MambaOut'  # Fallback to MambaOut
-        
-        if model_type == 'Transformer':
-            model = StarClassifierFusionTransformer(
-                d_model_spectra=d_model_spectra,
-                d_model_gaia=d_model_gaia,
-                num_classes=num_classes,
-                input_dim_spectra=input_dim_spectra,
-                input_dim_gaia=input_dim_gaia,
-                token_dim_spectra=token_dim_spectra,
-                token_dim_gaia=token_dim_gaia
-            )
-        elif model_type == 'MambaOut':
-            model = StarClassifierFusionMambaOut(
-                d_model_spectra=d_model_spectra,
-                d_model_gaia=d_model_gaia,
-                num_classes=num_classes,
-                input_dim_spectra=input_dim_spectra,
-                input_dim_gaia=input_dim_gaia,
-                token_dim_spectra=token_dim_spectra,
-                token_dim_gaia=token_dim_gaia
-            )
-        
-        # Load state dictionary
-        state_dict = torch.load(model_path, map_location=torch.device('cpu'))
-        
-        # Check if the state_dict is wrapped (common in distributed training)
-        # If keys start with 'module.', remove that prefix
-        if all(k.startswith('module.') for k in state_dict.keys()):
-            print("Removing 'module.' prefix from state dict keys")
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        
-        # Now match the keys to load the state dict
-        model.load_state_dict(state_dict)
-        
-        # Set model to evaluation mode
-        model.eval()
-        
-        return model
-        
-    except Exception as e:
-        print(f"Error loading model from {model_path}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-def load_model(model_path, input_dim_spectra=3647, input_dim_gaia=18, num_classes=55):
-    """
-    Load a saved PyTorch model from a state dictionary.
-    
-    Args:
-        model_path (str): Path to the saved model state dict file
-        input_dim_spectra (int): Input dimension for spectra
-        input_dim_gaia (int): Input dimension for gaia
-        num_classes (int): Number of classes
-        
-    Returns:
-        model: Loaded PyTorch model
-    """
-    try:
-        # Determine model type from filename
-        model_type = None
-        if 'mamba_' in model_path.lower() or 'mamba.' in model_path.lower():
-            model_type = 'MAMBA'
+            if 'mambaout' not in model_path.lower():
+                model_type = 'MAMBA'
+            else:
+                model_type = 'MambaOut'
         elif 'transformer' in model_path.lower():
             model_type = 'Transformer'
         elif 'gated_cnn' in model_path.lower() or 'mambaout' in model_path.lower():
@@ -930,41 +736,90 @@ def load_model(model_path, input_dim_spectra=3647, input_dim_gaia=18, num_classe
             return None
         
         # Initialize parameters based on the model configurations in the original code
-        # Define model architecture configurations based on token config and model type
-        
-        # Default parameters that will be overridden based on token config
-        n_layers = 20 if model_type in ['MAMBA', 'MambaOut'] else 10  # Different default layers by model type
         n_heads = 8
-        d_state = 32 if model_type == 'MAMBA' else None  # Only for MAMBA models
-        d_conv = 4
         expand = 2
         
-        # Determine token config from filename
-        token_config = None
+        # Determine token config from filename and set correct parameters
         if '1_token' in model_path.lower():
             token_config = '1 Token'
-            d_model_spectra = 2048
-            d_model_gaia = 2048
-            token_dim_spectra = input_dim_spectra  # All features in one token (3647)
-            token_dim_gaia = input_dim_gaia        # All features in one token (18)
-            if model_type == 'MAMBA':
-                d_conv = 2  # Special case for MAMBA 1 Token configuration
+            
+            if model_type == 'MambaOut':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 3647  # Exact value instead of input_dim_spectra
+                token_dim_gaia = 18       # Exact value instead of input_dim_gaia
+                n_layers = 20
+                d_conv = 1  # MambaOut 1 Token has d_conv = 1
+            
+            elif model_type == 'MAMBA':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 3647  # Exact value
+                token_dim_gaia = 18       # Exact value
+                n_layers = 20
+                d_state = 32
+                d_conv = 2
+            
+            elif model_type == 'Transformer':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 3647  # Exact value
+                token_dim_gaia = 18       # Exact value
+                n_layers = 10
                 
         elif 'balanced' in model_path.lower():
             token_config = 'Balanced'
-            d_model_spectra = 2048
-            d_model_gaia = 2048
-            token_dim_spectra = 192  # Will create ~19 tokens for spectra (3647/192)
-            token_dim_gaia = 1       # Will create 18 tokens for gaia (18/1)
+            
+            if model_type == 'MambaOut':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 192
+                token_dim_gaia = 1
+                n_layers = 20
+                d_conv = 4
+            
+            elif model_type == 'MAMBA':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 192
+                token_dim_gaia = 1
+                n_layers = 20
+                d_state = 32
+                d_conv = 4
+            
+            elif model_type == 'Transformer':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 192
+                token_dim_gaia = 1
+                n_layers = 10
             
         else:  # max_tokens
             token_config = 'Max Tokens'
-            d_model_spectra = 1536
-            d_model_gaia = 1536
-            token_dim_spectra = 7    # Will create 522 tokens for spectra (3647/7)
-            token_dim_gaia = 1       # Will create 18 tokens for gaia (18/1)
-            if model_type == 'MAMBA':
-                d_state = 16  # Reduced state dimension for the Max Tokens MAMBA configuration
+            
+            if model_type == 'MambaOut':
+                d_model_spectra = 1536
+                d_model_gaia = 1536
+                token_dim_spectra = 7
+                token_dim_gaia = 1
+                n_layers = 20
+                d_conv = 4
+            
+            elif model_type == 'MAMBA':
+                d_model_spectra = 1536
+                d_model_gaia = 1536
+                token_dim_spectra = 7
+                token_dim_gaia = 1
+                n_layers = 20
+                d_state = 16
+                d_conv = 4
+            
+            elif model_type == 'Transformer':
+                d_model_spectra = 1536
+                d_model_gaia = 1536
+                token_dim_spectra = 7
+                token_dim_gaia = 1
+                n_layers = 10
         
         print(f"Creating model of type {model_type} with configuration: {token_config}")
         print(f"  d_model_spectra: {d_model_spectra}, d_model_gaia: {d_model_gaia}")
@@ -1127,6 +982,471 @@ def load_model(model_path, input_dim_spectra=3647, input_dim_gaia=18, num_classe
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
         # Now match the keys to load the state dict
+        model.load_state_dict(state_dict)
+        
+        # Set model to evaluation mode
+        model.eval()
+        
+        return model
+        
+    except Exception as e:
+        print(f"Error loading model from {model_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+
+def load_model(model_path, input_dim_spectra=3647, input_dim_gaia=18, num_classes=55):
+    """
+    Load a saved PyTorch model from a state dictionary.
+    
+    Args:
+        model_path (str): Path to the saved model state dict file
+        input_dim_spectra (int): Input dimension for spectra
+        input_dim_gaia (int): Input dimension for gaia
+        num_classes (int): Number of classes
+        
+    Returns:
+        model: Loaded PyTorch model
+    """
+    try:
+        # Determine model type from filename
+        model_type = None
+        if 'mamba_' in model_path.lower() or 'mamba.' in model_path.lower():
+            if 'mambaout' not in model_path.lower():
+                model_type = 'MAMBA'
+            else:
+                model_type = 'MambaOut'
+        elif 'transformer' in model_path.lower():
+            model_type = 'Transformer'
+        elif 'gated_cnn' in model_path.lower() or 'mambaout' in model_path.lower():
+            model_type = 'MambaOut'
+        else:
+            print(f"Unable to determine model type from filename: {model_path}")
+            return None
+        
+        # Initialize parameters based on the model configurations in the original code
+        n_heads = 8
+        expand = 2
+        
+        # Determine token config from filename and set correct parameters
+        if '1_token' in model_path.lower():
+            token_config = '1 Token'
+            
+            if model_type == 'MambaOut':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 3647  # Exact value instead of input_dim_spectra
+                token_dim_gaia = 18       # Exact value instead of input_dim_gaia
+                n_layers = 20
+                d_conv = 1  # MambaOut 1 Token has d_conv = 1
+            
+            elif model_type == 'MAMBA':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 3647  # Exact value
+                token_dim_gaia = 18       # Exact value
+                n_layers = 20
+                d_state = 32
+                d_conv = 2
+            
+            elif model_type == 'Transformer':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 3647  # Exact value
+                token_dim_gaia = 18       # Exact value
+                n_layers = 10
+                
+        elif 'balanced' in model_path.lower():
+            token_config = 'Balanced'
+            
+            if model_type == 'MambaOut':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 192
+                token_dim_gaia = 1
+                n_layers = 20
+                d_conv = 4
+            
+            elif model_type == 'MAMBA':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 192
+                token_dim_gaia = 1
+                n_layers = 20
+                d_state = 32
+                d_conv = 4
+            
+            elif model_type == 'Transformer':
+                d_model_spectra = 2048
+                d_model_gaia = 2048
+                token_dim_spectra = 192
+                token_dim_gaia = 1
+                n_layers = 10
+            
+        else:  # max_tokens
+            token_config = 'Max Tokens'
+            
+            if model_type == 'MambaOut':
+                d_model_spectra = 1536
+                d_model_gaia = 1536
+                token_dim_spectra = 7
+                token_dim_gaia = 1
+                n_layers = 20
+                d_conv = 4
+            
+            elif model_type == 'MAMBA':
+                d_model_spectra = 1536
+                d_model_gaia = 1536
+                token_dim_spectra = 7
+                token_dim_gaia = 1
+                n_layers = 20
+                d_state = 16
+                d_conv = 4
+            
+            elif model_type == 'Transformer':
+                d_model_spectra = 1536
+                d_model_gaia = 1536
+                token_dim_spectra = 7
+                token_dim_gaia = 1
+                n_layers = 10
+        
+        print(f"Creating model of type {model_type} with configuration: {token_config}")
+        print(f"  d_model_spectra: {d_model_spectra}, d_model_gaia: {d_model_gaia}")
+        print(f"  token_dim_spectra: {token_dim_spectra}, token_dim_gaia: {token_dim_gaia}")
+        print(f"  n_layers: {n_layers}, n_heads: {n_heads}")
+        if model_type == 'MAMBA':
+            print(f"  d_state: {d_state}, d_conv: {d_conv}, expand: {expand}")
+        elif model_type == 'MambaOut':
+            print(f"  d_conv: {d_conv}, expand: {expand}")
+        
+        # Define a custom FeatureTokenizer compatible with saved models
+        # This version uses token_embed instead of projection and doesn't use pos_embedding
+        class CompatibleFeatureTokenizer(nn.Module):
+            def __init__(self, input_dim, token_dim, d_model):
+                super().__init__()
+                self.n_tokens = (input_dim + token_dim - 1) // token_dim
+                self.token_dim = token_dim
+                self.input_dim = input_dim
+                self.token_embed = nn.Linear(token_dim, d_model)
+                
+            def forward(self, x):
+                batch_size = x.shape[0]
+                if self.input_dim % self.token_dim != 0:
+                    padding_size = self.n_tokens * self.token_dim - self.input_dim
+                    x = F.pad(x, (0, padding_size), "constant", 0)
+                x = x.reshape(batch_size, self.n_tokens, self.token_dim)
+                return self.token_embed(x)
+        
+        # Create model based on type
+        if model_type == 'MAMBA':
+            # Note: This might fail if the mamba_ssm package is not available
+            try:
+                from mamba_ssm import Mamba2
+                
+                # Define custom Mamba model class with compatible tokenizer
+                class StarClassifierFusionMambaTokenized(nn.Module):
+                    def __init__(
+                        self,
+                        d_model_spectra,
+                        d_model_gaia,
+                        num_classes,
+                        input_dim_spectra,
+                        input_dim_gaia,
+                        token_dim_spectra=64,
+                        token_dim_gaia=2,
+                        n_layers=10,
+                        use_cross_attention=True,
+                        n_cross_attn_heads=8,
+                        d_state=256,
+                        d_conv=4,
+                        expand=2,
+                    ):
+                        super().__init__()
+
+                        # Use compatible tokenizers
+                        self.tokenizer_spectra = CompatibleFeatureTokenizer(
+                            input_dim=input_dim_spectra,
+                            token_dim=token_dim_spectra,
+                            d_model=d_model_spectra
+                        )
+                        
+                        self.tokenizer_gaia = CompatibleFeatureTokenizer(
+                            input_dim=input_dim_gaia,
+                            token_dim=token_dim_gaia,
+                            d_model=d_model_gaia
+                        )
+
+                        # Rest of the implementation remains the same
+                        self.mamba_spectra = nn.Sequential(
+                            *[Mamba2(
+                                d_model=d_model_spectra,
+                                d_state=d_state,
+                                d_conv=d_conv,
+                                expand=expand,
+                            ) for _ in range(n_layers)]
+                        )
+
+                        self.mamba_gaia = nn.Sequential(
+                            *[Mamba2(
+                                d_model=d_model_gaia,
+                                d_state=d_state,
+                                d_conv=d_conv,
+                                expand=expand,
+                            ) for _ in range(n_layers)]
+                        )
+
+                        self.use_cross_attention = use_cross_attention
+                        if use_cross_attention:
+                            self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
+                            self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
+
+                        fusion_dim = d_model_spectra + d_model_gaia
+                        self.classifier = nn.Sequential(
+                            nn.LayerNorm(fusion_dim),
+                            nn.Linear(fusion_dim, num_classes)
+                        )
+                    
+                    def forward(self, x_spectra, x_gaia):
+                        x_spectra_tokens = self.tokenizer_spectra(x_spectra)
+                        x_gaia_tokens = self.tokenizer_gaia(x_gaia)
+                        
+                        x_spectra = self.mamba_spectra(x_spectra_tokens)
+                        x_gaia = self.mamba_gaia(x_gaia_tokens)          
+
+                        if self.use_cross_attention:
+                            x_spectra = self.cross_attn_block_spectra(x_spectra, x_gaia)
+                            x_gaia = self.cross_attn_block_gaia(x_gaia, x_spectra)
+                        
+                        x_spectra = x_spectra.mean(dim=1)
+                        x_gaia = x_gaia.mean(dim=1)
+
+                        x_fused = torch.cat([x_spectra, x_gaia], dim=-1)
+                        logits = self.classifier(x_fused)
+                        
+                        return logits
+                
+                model = StarClassifierFusionMambaTokenized(
+                    d_model_spectra=d_model_spectra,
+                    d_model_gaia=d_model_gaia,
+                    num_classes=num_classes,
+                    input_dim_spectra=input_dim_spectra,
+                    input_dim_gaia=input_dim_gaia,
+                    token_dim_spectra=token_dim_spectra,
+                    token_dim_gaia=token_dim_gaia,
+                    n_layers=n_layers,
+                    n_cross_attn_heads=n_heads,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand
+                )
+            except ImportError:
+                print("Mamba2 module not found. Using MambaOut model as a fallback.")
+                model_type = 'MambaOut'
+        
+        if model_type == 'Transformer':
+            # Modified Transformer with compatible tokenizer
+            class CompatibleTransformer(nn.Module):
+                def __init__(
+                    self,
+                    d_model_spectra,
+                    d_model_gaia,
+                    num_classes,
+                    input_dim_spectra,
+                    input_dim_gaia,
+                    token_dim_spectra=64,
+                    token_dim_gaia=2,
+                    n_layers=10,
+                    n_heads=8,
+                    use_cross_attention=True,
+                    n_cross_attn_heads=8,
+                    dropout=0.1,
+                ):
+                    super().__init__()
+
+                    # Use compatible tokenizers
+                    self.tokenizer_spectra = CompatibleFeatureTokenizer(
+                        input_dim=input_dim_spectra,
+                        token_dim=token_dim_spectra,
+                        d_model=d_model_spectra
+                    )
+                    
+                    self.tokenizer_gaia = CompatibleFeatureTokenizer(
+                        input_dim=input_dim_gaia,
+                        token_dim=token_dim_gaia,
+                        d_model=d_model_gaia
+                    )
+
+                    # Rest of the implementation same as StarClassifierFusionTransformer
+                    self.transformer_spectra = TransformerFeatureExtractor(
+                        d_model=d_model_spectra,
+                        n_layers=n_layers,
+                        n_heads=n_heads,
+                        dropout=dropout
+                    )
+
+                    self.transformer_gaia = TransformerFeatureExtractor(
+                        d_model=d_model_gaia,
+                        n_layers=n_layers,
+                        n_heads=n_heads,
+                        dropout=dropout
+                    )
+
+                    self.use_cross_attention = use_cross_attention
+                    if use_cross_attention:
+                        self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
+                        self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
+
+                    fusion_dim = d_model_spectra + d_model_gaia
+                    self.classifier = nn.Sequential(
+                        nn.LayerNorm(fusion_dim),
+                        nn.Dropout(dropout),
+                        nn.Linear(fusion_dim, num_classes)
+                    )
+                
+                def forward(self, x_spectra, x_gaia):
+                    x_spectra_tokens = self.tokenizer_spectra(x_spectra)
+                    x_gaia_tokens = self.tokenizer_gaia(x_gaia)
+                    
+                    x_spectra = self.transformer_spectra(x_spectra_tokens)
+                    x_gaia = self.transformer_gaia(x_gaia_tokens)
+
+                    if self.use_cross_attention:
+                        x_spectra = self.cross_attn_block_spectra(x_spectra, x_gaia)
+                        x_gaia = self.cross_attn_block_gaia(x_gaia, x_spectra)
+                    
+                    x_spectra = x_spectra.mean(dim=1)
+                    x_gaia = x_gaia.mean(dim=1)
+
+                    x_fused = torch.cat([x_spectra, x_gaia], dim=-1)
+                    logits = self.classifier(x_fused)
+                    
+                    return logits
+            
+            model = CompatibleTransformer(
+                d_model_spectra=d_model_spectra,
+                d_model_gaia=d_model_gaia,
+                num_classes=num_classes,
+                input_dim_spectra=input_dim_spectra,
+                input_dim_gaia=input_dim_gaia,
+                token_dim_spectra=token_dim_spectra,
+                token_dim_gaia=token_dim_gaia,
+                n_layers=n_layers,
+                n_heads=n_heads
+            )
+            
+        elif model_type == 'MambaOut':
+            # Modified MambaOut with compatible tokenizer
+            class CompatibleMambaOut(nn.Module):
+                def __init__(
+                    self,
+                    d_model_spectra,
+                    d_model_gaia,
+                    num_classes,
+                    input_dim_spectra,
+                    input_dim_gaia,
+                    token_dim_spectra=64,
+                    token_dim_gaia=2,
+                    n_layers=6,
+                    use_cross_attention=True,
+                    n_cross_attn_heads=8,
+                    d_conv=4,
+                    expand=2,
+                ):
+                    super().__init__()
+
+                    # Use compatible tokenizers
+                    self.tokenizer_spectra = CompatibleFeatureTokenizer(
+                        input_dim=input_dim_spectra,
+                        token_dim=token_dim_spectra,
+                        d_model=d_model_spectra
+                    )
+                    
+                    self.tokenizer_gaia = CompatibleFeatureTokenizer(
+                        input_dim=input_dim_gaia,
+                        token_dim=token_dim_gaia,
+                        d_model=d_model_gaia
+                    )
+
+                    # MambaOut for spectra
+                    self.mamba_spectra = nn.Sequential(
+                        *[SequenceMambaOut(
+                            d_model=d_model_spectra,
+                            d_conv=d_conv,
+                            expand=expand,
+                            depth=1,
+                            drop_path=0.1 if i > 0 else 0.0,
+                        ) for i in range(n_layers)]
+                    )
+
+                    # MambaOut for gaia
+                    self.mamba_gaia = nn.Sequential(
+                        *[SequenceMambaOut(
+                            d_model=d_model_gaia,
+                            d_conv=d_conv,
+                            expand=expand,
+                            depth=1,
+                            drop_path=0.1 if i > 0 else 0.0,
+                        ) for i in range(n_layers)]
+                    )
+
+                    # Cross Attention (Optional)
+                    self.use_cross_attention = use_cross_attention
+                    if use_cross_attention:
+                        self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
+                        self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
+
+                    # Final Classifier
+                    fusion_dim = d_model_spectra + d_model_gaia
+                    self.classifier = nn.Sequential(
+                        nn.LayerNorm(fusion_dim),
+                        nn.Linear(fusion_dim, num_classes)
+                    )
+                
+                def forward(self, x_spectra, x_gaia):
+                    x_spectra = self.tokenizer_spectra(x_spectra)
+                    x_gaia = self.tokenizer_gaia(x_gaia)
+
+                    x_spectra = self.mamba_spectra(x_spectra)
+                    x_gaia = self.mamba_gaia(x_gaia)
+
+                    if self.use_cross_attention:
+                        x_spectra_fused = self.cross_attn_block_spectra(x_spectra, x_gaia)
+                        x_gaia_fused = self.cross_attn_block_gaia(x_gaia, x_spectra)
+                        
+                        x_spectra = x_spectra_fused
+                        x_gaia = x_gaia_fused
+                    
+                    x_spectra = x_spectra.mean(dim=1)
+                    x_gaia = x_gaia.mean(dim=1)
+
+                    x_fused = torch.cat([x_spectra, x_gaia], dim=-1)
+                    logits = self.classifier(x_fused)
+                    
+                    return logits
+            
+            model = CompatibleMambaOut(
+                d_model_spectra=d_model_spectra,
+                d_model_gaia=d_model_gaia,
+                num_classes=num_classes,
+                input_dim_spectra=input_dim_spectra,
+                input_dim_gaia=input_dim_gaia,
+                token_dim_spectra=token_dim_spectra,
+                token_dim_gaia=token_dim_gaia,
+                n_layers=n_layers,
+                d_conv=d_conv,
+                expand=expand
+            )
+        
+        # Load state dictionary
+        state_dict = torch.load(model_path, map_location=torch.device('cpu'))
+        
+        # Check if the state_dict is wrapped
+        if all(k.startswith('module.') for k in state_dict.keys()):
+            print("Removing 'module.' prefix from state dict keys")
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        # Now load the state dict
         model.load_state_dict(state_dict)
         
         # Set model to evaluation mode
@@ -2315,3 +2635,320 @@ if __name__ == "__main__":
             generate = input("Generate visualizations? [y/N]: ").lower() == 'y'
             if generate:
                 generate_visualizations(args.class_names_path)
+
+
+
+# Rotary Position Embeddings implementation
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=4096):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.max_seq_len = max_seq_len
+        
+        # Generate position embeddings once at initialization
+        self._generate_embeddings()
+        
+    def _generate_embeddings(self):
+        t = torch.arange(self.max_seq_len, dtype=torch.float)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().view(self.max_seq_len, 1, -1)
+        sin = emb.sin().view(self.max_seq_len, 1, -1)
+        self.register_buffer('cos_cached', cos)
+        self.register_buffer('sin_cached', sin)
+        
+    def forward(self, seq_len):
+        return self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...]
+
+def rotate_half(x):
+    """Rotate half the hidden dims of the input."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Apply rotary position embeddings to q and k tensors."""
+    # Handle the case where q and k have shape [batch_size, seq_len, head_dim]
+    # or [batch_size, n_heads, seq_len, head_dim]
+    if q.dim() == 3:
+        # [batch_size, seq_len, head_dim] -> [batch_size, seq_len, 1, head_dim]
+        q = q.unsqueeze(2)
+        k = k.unsqueeze(2)
+        # After this operation, we squeeze back
+        squeeze_after = True
+    else:
+        squeeze_after = False
+    
+    # Reshape cos and sin for proper broadcasting
+    # [seq_len, 1, head_dim] -> [1, seq_len, 1, head_dim]
+    cos = cos.unsqueeze(0)
+    sin = sin.unsqueeze(0)
+    
+    # Apply rotation
+    q_rot = (q * cos) + (rotate_half(q) * sin)
+    k_rot = (k * cos) + (rotate_half(k) * sin)
+    
+    if squeeze_after:
+        q_rot = q_rot.squeeze(2)
+        k_rot = k_rot.squeeze(2)
+    
+    return q_rot, k_rot
+
+class RotarySelfAttention(nn.Module):
+    """Self-attention with rotary position embeddings."""
+    def __init__(self, dim, n_heads=8, dropout=0.1):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        assert self.head_dim * n_heads == dim, "dim must be divisible by n_heads"
+        
+        # QKV projections
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        
+        # Rotary positional embedding
+        self.rope = RotaryEmbedding(self.head_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, dim]
+            
+        Returns:
+            output: Tensor of same shape as input
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Project to queries, keys, values
+        q = self.q_proj(x)  # [batch_size, seq_len, dim]
+        k = self.k_proj(x)  # [batch_size, seq_len, dim]
+        v = self.v_proj(x)  # [batch_size, seq_len, dim]
+        
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)  
+        k = k.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        
+        # Get position embeddings
+        cos, sin = self.rope(seq_len)
+        
+        # Apply rotary position embeddings to q and k
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        # Transpose for efficient batch matrix multiplication
+        q = q.transpose(1, 2)  # [batch_size, n_heads, seq_len, head_dim]
+        k = k.transpose(1, 2)  # [batch_size, n_heads, seq_len, head_dim]
+        v = v.transpose(1, 2)  # [batch_size, n_heads, seq_len, head_dim]
+        
+        # Compute scaled dot-product attention
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [batch_size, n_heads, seq_len, seq_len]
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention weights to values
+        output = torch.matmul(attn_weights, v)  # [batch_size, n_heads, seq_len, head_dim]
+        
+        # Reshape back to original format
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        
+        # Apply output projection
+        output = self.out_proj(output)
+        
+        return output
+
+class TransformerBlock(nn.Module):
+    """Transformer block with rotary self-attention and feed-forward network."""
+    def __init__(self, dim, n_heads=8, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = RotarySelfAttention(dim, n_heads, dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * dim, dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, dim]
+        """
+        # Self-attention with residual connection
+        x = x + self.attn(self.norm1(x))
+        
+        # FFN with residual connection
+        x = x + self.ffn(self.norm2(x))
+        
+        return x
+
+class TransformerFeatureExtractor(nn.Module):
+    """Stack of transformer blocks for feature extraction."""
+    def __init__(self, d_model, n_layers=6, n_heads=8, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, dropout)
+            for _ in range(n_layers)
+        ])
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, d_model]
+        
+        Returns:
+            Processed tensor of same shape
+        """
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+class CrossAttentionBlock(nn.Module):
+    """
+    Cross-attention block to attend from one modality to another.
+    """
+    def __init__(self, dim, n_heads=8):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=n_heads,
+            batch_first=True
+        )
+    
+    def forward(self, x, context):
+        """
+        Args:
+            x: Query tensor of shape [batch_size, seq_len_q, dim]
+            context: Key/value tensor of shape [batch_size, seq_len_kv, dim]
+        
+        Returns:
+            Output tensor of shape [batch_size, seq_len_q, dim]
+        """
+        x_norm = self.norm(x)
+        attn_output, _ = self.attention(
+            query=x_norm,
+            key=context,
+            value=context
+        )
+        return x + attn_output
+
+
+class StarClassifierFusionTransformer(nn.Module):
+    """Transformer-based feature extractor with tokenization for multi-modal fusion."""
+    def __init__(
+        self,
+        d_model_spectra,
+        d_model_gaia,
+        num_classes,
+        input_dim_spectra,
+        input_dim_gaia,
+        token_dim_spectra=64,  # Size of each token for spectra
+        token_dim_gaia=2,      # Size of each token for gaia
+        n_layers=6,
+        n_heads=8,
+        use_cross_attention=True,
+        n_cross_attn_heads=8,
+        dropout=0.1,
+    ):
+        """
+        Args:
+            d_model_spectra (int): embedding dimension for the spectra Transformer
+            d_model_gaia (int): embedding dimension for the gaia Transformer
+            num_classes (int): multi-label classification
+            input_dim_spectra (int): # of features for spectra
+            input_dim_gaia (int): # of features for gaia
+            token_dim_spectra (int): size of each token for spectra features
+            token_dim_gaia (int): size of each token for gaia features
+            n_layers (int): depth for each Transformer
+            n_heads (int): number of attention heads
+            use_cross_attention (bool): whether to use cross-attention
+            n_cross_attn_heads (int): number of heads for cross-attention
+            dropout (float): dropout rate
+        """
+        super().__init__()
+
+        # --- Feature Tokenizers ---
+        self.tokenizer_spectra = FeatureTokenizer(
+            input_dim=input_dim_spectra,
+            token_dim=token_dim_spectra,
+            d_model=d_model_spectra
+        )
+        
+        self.tokenizer_gaia = FeatureTokenizer(
+            input_dim=input_dim_gaia,
+            token_dim=token_dim_gaia,
+            d_model=d_model_gaia
+        )
+
+        # --- Transformer for spectra ---
+        self.transformer_spectra = TransformerFeatureExtractor(
+            d_model=d_model_spectra,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout
+        )
+
+        # --- Transformer for gaia ---
+        self.transformer_gaia = TransformerFeatureExtractor(
+            d_model=d_model_gaia,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout
+        )
+
+        # --- Cross Attention (Optional) ---
+        self.use_cross_attention = use_cross_attention
+        if use_cross_attention:
+            self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
+            self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
+
+        # --- Final Classifier ---
+        fusion_dim = d_model_spectra + d_model_gaia
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, num_classes)
+        )
+    
+    def forward(self, x_spectra, x_gaia):
+        """
+        Args:
+            x_spectra: Spectra features of shape [batch_size, input_dim_spectra]
+            x_gaia: Gaia features of shape [batch_size, input_dim_gaia]
+            
+        Returns:
+            logits: Classification logits of shape [batch_size, num_classes]
+        """
+        # Tokenize input features
+        # From [batch_size, input_dim] to [batch_size, num_tokens, d_model]
+        x_spectra_tokens = self.tokenizer_spectra(x_spectra)
+        x_gaia_tokens = self.tokenizer_gaia(x_gaia)
+        
+        # Process through transformers
+        x_spectra = self.transformer_spectra(x_spectra_tokens)  # [batch_size, num_tokens_spectra, d_model]
+        x_gaia = self.transformer_gaia(x_gaia_tokens)          # [batch_size, num_tokens_gaia, d_model]
+
+        # Optional cross-attention
+        if self.use_cross_attention:
+            x_spectra = self.cross_attn_block_spectra(x_spectra, x_gaia)
+            x_gaia = self.cross_attn_block_gaia(x_gaia, x_spectra)
+        
+        # Global pooling over sequence dimension
+        x_spectra = x_spectra.mean(dim=1)  # [batch_size, d_model]
+        x_gaia = x_gaia.mean(dim=1)        # [batch_size, d_model]
+
+        # Concatenate for fusion
+        x_fused = torch.cat([x_spectra, x_gaia], dim=-1)  # [batch_size, 2*d_model]
+
+        # Final classification
+        logits = self.classifier(x_fused)  # [batch_size, num_classes]
+        
+        return logits
