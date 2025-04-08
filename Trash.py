@@ -7429,3 +7429,122 @@ class StarClassifierFusionMambaOut(nn.Module):
         # --- Final classification ---
         logits = self.classifier(x_fused)  # (B, num_classes)
         return logits
+    
+    class StarClassifierFusionMambaOut(nn.Module):
+    def __init__(
+        self,
+        d_model_spectra,
+        d_model_gaia,
+        num_classes,
+        input_dim_spectra,
+        input_dim_gaia,
+        token_dim_spectra=64,  # New parameter for token size
+        token_dim_gaia=2,      # New parameter for token size
+        n_layers=6,
+        use_cross_attention=True,
+        n_cross_attn_heads=8,
+        d_state=256,
+        d_conv=4,
+        expand=2,
+    ):
+        """
+        Args:
+            d_model_spectra (int): embedding dimension for the spectra MAMBA
+            d_model_gaia (int): embedding dimension for the gaia MAMBA
+            num_classes (int): multi-label classification
+            input_dim_spectra (int): # of features for spectra
+            input_dim_gaia (int): # of features for gaia
+            token_dim_spectra (int): size of each token for spectra features
+            token_dim_gaia (int): size of each token for gaia features
+            n_layers (int): depth for each MAMBA
+            use_cross_attention (bool): whether to use cross-attention
+            n_cross_attn_heads (int): number of heads for cross-attention
+        """
+        super().__init__()
+
+        # --- Feature Tokenizers ---
+        self.tokenizer_spectra = FeatureTokenizer(
+            input_dim=input_dim_spectra,
+            token_dim=token_dim_spectra,
+            d_model=d_model_spectra
+        )
+        
+        self.tokenizer_gaia = FeatureTokenizer(
+            input_dim=input_dim_gaia,
+            token_dim=token_dim_gaia,
+            d_model=d_model_gaia
+        )
+
+        # --- MambaOut for spectra ---
+        self.mamba_spectra = nn.Sequential(
+            *[SequenceMambaOut(
+                d_model=d_model_spectra,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                depth=1,
+                drop_path=0.1 if i > 0 else 0.0,
+            ) for i in range(n_layers)]
+        )
+
+        # --- MambaOut for gaia ---
+        self.mamba_gaia = nn.Sequential(
+            *[SequenceMambaOut(
+                d_model=d_model_gaia,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                depth=1,
+                drop_path=0.1 if i > 0 else 0.0,
+            ) for i in range(n_layers)]
+        )
+
+        # --- Cross Attention (Optional) ---
+        self.use_cross_attention = use_cross_attention
+        if use_cross_attention:
+            self.cross_attn_block_spectra = CrossAttentionBlock(d_model_spectra, n_heads=n_cross_attn_heads)
+            self.cross_attn_block_gaia = CrossAttentionBlock(d_model_gaia, n_heads=n_cross_attn_heads)
+
+        # --- Final Classifier ---
+        fusion_dim = d_model_spectra + d_model_gaia
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, num_classes)
+        )
+    
+    def forward(self, x_spectra, x_gaia):
+        """
+        x_spectra : (batch_size, input_dim_spectra)
+        x_gaia    : (batch_size, input_dim_gaia)
+        """
+        # Tokenize input features
+        # From [batch_size, input_dim] to [batch_size, num_tokens, d_model]
+        x_spectra = self.tokenizer_spectra(x_spectra)  # (B, num_tokens_spectra, d_model_spectra)
+        x_gaia = self.tokenizer_gaia(x_gaia)           # (B, num_tokens_gaia, d_model_gaia)
+
+        # --- MambaOut encoding (each modality separately) ---
+        x_spectra = self.mamba_spectra(x_spectra)  # (B, num_tokens_spectra, d_model_spectra)
+        x_gaia = self.mamba_gaia(x_gaia)           # (B, num_tokens_gaia, d_model_gaia)
+
+        # Optionally, use cross-attention to fuse the representations
+        if self.use_cross_attention:
+            # Cross-attention from spectra -> gaia
+            x_spectra_fused = self.cross_attn_block_spectra(x_spectra, x_gaia)
+            # Cross-attention from gaia -> spectra
+            x_gaia_fused = self.cross_attn_block_gaia(x_gaia, x_spectra)
+            
+            # Update x_spectra and x_gaia
+            x_spectra = x_spectra_fused
+            x_gaia = x_gaia_fused
+        
+        # --- Pool across sequence dimension ---
+        x_spectra = x_spectra.mean(dim=1)  # (B, d_model_spectra)
+        x_gaia = x_gaia.mean(dim=1)        # (B, d_model_gaia)
+
+        # --- Late Fusion by Concatenation ---
+        x_fused = torch.cat([x_spectra, x_gaia], dim=-1)  # (B, d_model_spectra + d_model_gaia)
+
+        # --- Final classification ---
+        logits = self.classifier(x_fused)  # (B, num_classes)
+        return logits
+    
