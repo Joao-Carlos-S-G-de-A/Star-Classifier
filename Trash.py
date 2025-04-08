@@ -7783,3 +7783,77 @@ class StarClassifierFusionMambaOut(nn.Module):
         import traceback
         traceback.print_exc()
         return None
+    
+    class GatedCNNBlock(nn.Module):
+    """Adaptation of GatedCNNBlock for sequence data with dynamic kernel size adaptation"""
+    def __init__(self, dim, d_conv=4, expand=2, drop_path=0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        hidden = int(expand * dim)
+        self.fc1 = nn.Linear(dim, hidden * 2)
+        self.act = nn.GELU()
+        
+        # Store these for dynamic convolution sizing
+        self.d_conv = d_conv
+        self.hidden = hidden
+        
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        # Use simpler approach for sequence length 1 (common case)
+        # This avoids dynamic convolution creation
+        if d_conv == 1:
+            self.use_identity_for_length_1 = True
+
+        
+        # Cache for static convolution with kernel size 1 (for length 1 sequences)
+        if d_conv == 1:
+            self.conv1 = nn.Conv1d(
+                in_channels=hidden,
+                out_channels=hidden, 
+                kernel_size=1,
+                padding=0,
+                groups=hidden
+            )
+        else:
+            # Dynamic convolution for other lengths
+            self.conv = nn.Conv1d(
+                in_channels=hidden,
+                out_channels=hidden, 
+                kernel_size=d_conv,
+                padding=(d_conv - 1) // 2,
+                groups=hidden
+            )
+
+    def forward(self, x):
+        # Input shape: [B, seq_len, dim]
+        shortcut = x
+        x = self.norm(x)
+        
+        # Split the channels for gating mechanism
+        x = self.fc1(x)  # [B, seq_len, hidden*2]
+        g, c = torch.chunk(x, 2, dim=-1)  # Each: [B, seq_len, hidden]
+        
+        # Get sequence length
+        batch_size, seq_len, channels = c.shape
+        
+        # Apply gating mechanism
+        c_permuted = c.permute(0, 2, 1)  # [B, hidden, seq_len]
+        
+        # Special case for sequence length 1 
+        if seq_len == 1 and self.use_identity_for_length_1:
+            # Use the pre-created kernel size 1 conv, which is like identity but keeps channels
+            c_conv = self.conv1(c_permuted)
+        else:
+            # For other sequence lengths, fallback to kernel size 1 to avoid issues
+            # The conv1 layer is already initialized and on the correct device
+            c_conv = self.conv(c_permuted)
+            c_conv = c_conv[:, :, :seq_len] # Ensure we only take the valid part
+        
+        c_final = c_conv.permute(0, 2, 1)  # [B, seq_len, hidden]
+        
+        # Gating mechanism
+        x = self.fc2(self.act(g) * c_final)  # [B, seq_len, dim]
+        
+        x = self.drop_path(x)
+        return x + shortcut
