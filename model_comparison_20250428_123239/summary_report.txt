@@ -1,0 +1,59 @@
+MODEL EVALUATION SUMMARY
+======================
+
+Best Models by Metric:
+  Best micro_f1: MambaOut_1token (0.6485)
+  Best macro_f1: MambaOut_1token (0.4402)
+  Best weighted_f1: MambaOut_1token (0.6332)
+  Best macro_auroc: MambaOut_1token (0.9366)
+
+Model Family Comparison:
+  MambaOut:
+    Macro F1: 0.3831
+    Average Size: 3408.93 MB
+  Transformer:
+    Macro F1: 0.3708
+    Average Size: 3475.52 MB
+
+Token Configuration Analysis:
+  1token:
+    Average Macro F1: 0.4350
+    Best Model: MambaOut_1token (0.4402)
+  19_18token:
+    Average Macro F1: 0.4069
+    Best Model: Transformer_19_18token (0.4219)
+  522_18token:
+    Average Macro F1: 0.2890
+    Best Model: MambaOut_522_18token (0.3172)
+
+Detailed Model Rankings:
+  1. MambaOut_1token:
+     Macro F1: 0.4402
+     Size: 4001.07 MB
+     Parameters: 1,048,856,631
+     Token Config: 1 spectra, 1 gaia
+  2. Transformer_1token:
+     Macro F1: 0.4297
+     Size: 4079.67 MB
+     Parameters: 1,048,487,991
+     Token Config: 1 spectra, 1 gaia
+  3. Transformer_19_18token:
+     Macro F1: 0.4219
+     Size: 4052.55 MB
+     Parameters: 1,041,377,335
+     Token Config: 19 spectra, 18 gaia
+  4. MambaOut_19_18token:
+     Macro F1: 0.3919
+     Size: 3975.82 MB
+     Parameters: 1,042,237,495
+     Token Config: 19 spectra, 18 gaia
+  5. MambaOut_522_18token:
+     Macro F1: 0.3172
+     Size: 2249.91 MB
+     Parameters: 589,799,479
+     Token Config: 521 spectra, 18 gaia
+  6. Transformer_522_18token:
+     Macro F1: 0.2608
+     Size: 2294.33 MB
+     Parameters: 585,713,719
+     Token Config: 521 spectra, 18 gaia

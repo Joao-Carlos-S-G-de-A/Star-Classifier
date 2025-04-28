@@ -7857,3 +7857,1578 @@ class StarClassifierFusionMambaOut(nn.Module):
         
         x = self.drop_path(x)
         return x + shortcut
+    
+
+
+    import torch
+import numpy as np
+import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from sklearn.metrics import f1_score, precision_score, recall_score, hamming_loss, roc_auc_score, average_precision_score
+import os
+import json
+import gc
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from tqdm import tqdm
+import pickle
+from torch.utils.data import Dataset
+from sklearn.metrics import roc_auc_score
+
+
+# Import your model architectures
+from Fusion_Models import StarClassifierFusionMambaOut, StarClassifierFusionTransformer, StarClassifierFusionMambaTokenized
+
+class MultiModalBalancedMultiLabelDataset(Dataset):
+    """
+    A balanced multi-label dataset that returns (X_spectra, X_gaia, y).
+    It uses the same balancing strategy as `BalancedMultiLabelDataset`.
+    """
+    def __init__(self, X_spectra, X_gaia, y, limit_per_label=201):
+        """
+        Args:
+            X_spectra (torch.Tensor): [num_samples, num_spectra_features]
+            X_gaia (torch.Tensor): [num_samples, num_gaia_features]
+            y (torch.Tensor): [num_samples, num_classes], multi-hot labels
+            limit_per_label (int): limit or target number of samples per label
+        """
+        self.X_spectra = X_spectra
+        self.X_gaia = X_gaia
+        self.y = y
+        self.limit_per_label = limit_per_label
+        self.num_classes = y.shape[1]
+        self.indices = self.balance_classes()
+        
+    def balance_classes(self):
+        indices = []
+        class_counts = torch.sum(self.y, axis=0)
+        for cls in range(self.num_classes):
+            cls_indices = np.where(self.y[:, cls] == 1)[0]
+            if len(cls_indices) < self.limit_per_label:
+                if len(cls_indices) == 0:
+                    # No samples for this class
+                    continue
+                extra_indices = np.random.choice(
+                    cls_indices, self.limit_per_label - len(cls_indices), replace=True
+                )
+                cls_indices = np.concatenate([cls_indices, extra_indices])
+            elif len(cls_indices) > self.limit_per_label:
+                cls_indices = np.random.choice(cls_indices, self.limit_per_label, replace=False)
+            indices.extend(cls_indices)
+        indices = np.unique(indices)
+        np.random.shuffle(indices)
+        return indices
+
+    def re_sample(self):
+        self.indices = self.balance_classes()
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        index = self.indices[idx]
+        return (
+            self.X_spectra[index],  # spectra features
+            self.X_gaia[index],     # gaia features
+            self.y[index],          # multi-hot labels
+        )
+    
+def calculate_class_weights(y):
+    if y.ndim > 1:  
+        class_counts = np.sum(y, axis=0)  
+    else:
+        class_counts = np.bincount(y)
+
+    total_samples = y.shape[0] if y.ndim > 1 else len(y)
+    class_counts = np.where(class_counts == 0, 1, class_counts)  # Prevent division by zero
+    class_weights = total_samples / (len(class_counts) * class_counts)
+    
+    return class_weights
+
+def calculate_metrics(y_true, y_pred):
+    metrics = {
+        "micro_f1": f1_score(y_true, y_pred, average='micro'),
+        "macro_f1": f1_score(y_true, y_pred, average='macro'),
+        "weighted_f1": f1_score(y_true, y_pred, average='weighted'),
+        "micro_precision": precision_score(y_true, y_pred, average='micro', zero_division=1),
+        "macro_precision": precision_score(y_true, y_pred, average='macro', zero_division=1),
+        "weighted_precision": precision_score(y_true, y_pred, average='weighted', zero_division=1),
+        "micro_recall": recall_score(y_true, y_pred, average='micro'),
+        "macro_recall": recall_score(y_true, y_pred, average='macro'),
+        "weighted_recall": recall_score(y_true, y_pred, average='weighted'),
+        "hamming_loss": hamming_loss(y_true, y_pred)
+    }
+    
+    # Check if there are at least two classes present in y_true
+    #if len(np.unique(y_true)) > 1:
+        #metrics["roc_auc"] = roc_auc_score(y_true, y_pred, average='macro', multi_class='ovr')
+    #else:
+       # metrics["roc_auc"] = None  # or you can set it to a default value or message
+    
+    return metrics
+
+
+
+def load_data():
+    """Load and preprocess the data"""
+    print("Loading datasets...")
+    
+    # Load classes
+    with open("Pickles/Updated_List_of_Classes_ubuntu.pkl", "rb") as f:
+        classes = pickle.load(f)
+    
+    # Load test data
+    with open("Pickles/test_data_transformed_ubuntu.pkl", "rb") as f:
+        X_test_full = pickle.load(f)
+    
+    # Extract labels
+    y_test = X_test_full[classes]
+    
+    # Drop labels from both datasets
+    X_test_full.drop(classes, axis=1, inplace=True)
+    
+    # Define Gaia columns
+    gaia_columns = ["parallax", "ra", "dec", "ra_error", "dec_error", "parallax_error", 
+                   "pmra", "pmdec", "pmra_error", "pmdec_error", "phot_g_mean_flux", 
+                   "flagnopllx", "phot_g_mean_flux_error", "phot_bp_mean_flux", 
+                   "phot_rp_mean_flux", "phot_bp_mean_flux_error", 
+                   "phot_rp_mean_flux_error", "flagnoflux"]
+    
+    # Split data into spectra and gaia parts
+    X_test_spectra = X_test_full.drop(columns={"otype", "obsid", *gaia_columns})
+    
+    X_test_gaia = X_test_full[gaia_columns]
+    
+    # Free up memory
+    del X_test_full
+    gc.collect()
+    
+    # Convert to PyTorch tensors
+    X_test_spectra_tensor = torch.tensor(X_test_spectra.values, dtype=torch.float32)
+
+    X_test_gaia_tensor = torch.tensor(X_test_gaia.values, dtype=torch.float32)
+    
+    y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32)
+    
+    return (X_test_spectra_tensor, X_test_gaia_tensor, y_test_tensor)
+
+def evaluate_model(model, test_loader, device='cuda'):
+    """Evaluate a model on test data and return comprehensive metrics"""
+    model.eval()
+    test_loss = 0.0
+    test_acc = 0.0
+    y_true, y_pred, y_prob = [], [], []
+    
+    # Compute class weights for loss function
+    all_labels = []
+    for _, _, y_batch in test_loader:
+        all_labels.extend(y_batch.cpu().numpy())
+    
+    class_weights = calculate_class_weights(np.array(all_labels))
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights)
+    
+    # Evaluation loop
+    with torch.no_grad():
+        for X_spc, X_ga, y_batch in tqdm(test_loader, desc="Evaluating"):
+            X_spc, X_ga, y_batch = X_spc.to(device), X_ga.to(device), y_batch.to(device)
+            outputs = model(X_spc, X_ga)
+            loss = criterion(outputs, y_batch)
+            test_loss += loss.item() * X_spc.size(0)
+            
+            probs = torch.sigmoid(outputs)
+            predicted = (probs > 0.5).float()
+            correct = (predicted == y_batch).float()
+            test_acc += correct.mean(dim=1).mean().item()
+
+            y_true.extend(y_batch.cpu().numpy())
+            y_pred.extend(predicted.cpu().numpy())
+            y_prob.extend(probs.cpu().numpy())
+    
+    # Convert to numpy arrays
+    y_true_array = np.array(y_true)
+    y_pred_array = np.array(y_pred)
+    y_prob_array = np.array(y_prob)
+    
+    # Calculate metrics
+    metrics = calculate_metrics(y_true_array, y_pred_array)
+    
+    # Add average metrics
+    metrics["avg_loss"] = test_loss / len(test_loader.dataset)
+    metrics["avg_accuracy"] = test_acc / len(test_loader)
+    
+    # Calculate AUROC if possible
+    try:
+        class_aurocs = []
+        for i in range(y_true_array.shape[1]):
+            if len(np.unique(y_true_array[:, i])) > 1:
+                class_auroc = roc_auc_score(y_true_array[:, i], y_prob_array[:, i])
+                class_aurocs.append(class_auroc)
+        
+        if class_aurocs:
+            metrics["macro_auroc"] = np.mean(class_aurocs)
+    except Exception as e:
+        print(f"Error calculating AUROC: {e}")
+        metrics["macro_auroc"] = float('nan')
+    
+    return metrics
+
+def main():
+    # Create results directory
+    results_dir = f"model_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs("Models", exist_ok=True)
+    
+    # Set device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    # Load data
+    (X_test_spectra, X_test_gaia, y_test) = load_data()
+    
+    # Create datasets and dataloaders
+    batch_size = 16
+    batch_limit = int(batch_size / 2.5)
+    
+
+    test_dataset = MultiModalBalancedMultiLabelDataset(
+        X_test_spectra, X_test_gaia, y_test, limit_per_label=batch_limit
+    )
+    
+
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+
+    print(f"Test samples: {len(test_dataset)}")
+    # Define model configurations to evaluate
+    model_configs = [
+        # MambaOut Models
+        {
+            "name": "MambaOut_1token",
+            "model_class": StarClassifierFusionMambaOut,
+            "params": {
+                "d_model_spectra": 2048,
+                "d_model_gaia": 2048,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 3647,  # 1 token
+                "token_dim_gaia": 18,       # 1 token
+                "n_layers": 20,
+                "d_conv": 1,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8
+            },
+            "checkpoint": "Comparing_Mambas_Trans/gated_cnn_(mambaout)_1_token.pth"
+        },
+        {
+            "name": "MambaOut_19_18token",
+            "model_class": StarClassifierFusionMambaOut,
+            "params": {
+                "d_model_spectra": 2048,
+                "d_model_gaia": 2048,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 192,  # ~19 tokens
+                "token_dim_gaia": 1,       # 18 tokens
+                "n_layers": 20,
+                "d_conv": 4,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8
+            },
+            "checkpoint": "Comparing_Mambas_Trans/gated_cnn_(mambaout)_balanced.pth"
+        },
+        {
+            "name": "MambaOut_522_18token",
+            "model_class": StarClassifierFusionMambaOut,
+            "params": {
+                "d_model_spectra": 1536,
+                "d_model_gaia": 1536,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 7,    # ~522 tokens
+                "token_dim_gaia": 1,       # 18 tokens
+                "n_layers": 20,
+                "d_conv": 32,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8
+            },
+            "checkpoint": "Comparing_Mambas_Trans/gated_cnn_(mambaout)_max_tokens.pth"
+        },
+        
+        # Transformer Models
+        {
+            "name": "Transformer_1token",
+            "model_class": StarClassifierFusionTransformer,
+            "params": {
+                "d_model_spectra": 2048,
+                "d_model_gaia": 2048,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 3647,  # 1 token
+                "token_dim_gaia": 18,       # 1 token
+                "n_layers": 10,
+                "n_heads": 8,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8,
+                "dropout": 0.1
+            },
+            "checkpoint": "Comparing_Mambas_Trans/transformer_1_token.pth"
+        },
+        {
+            "name": "Transformer_19_18token",
+            "model_class": StarClassifierFusionTransformer,
+            "params": {
+                "d_model_spectra": 2048,
+                "d_model_gaia": 2048,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 192,  # ~19 tokens
+                "token_dim_gaia": 1,       # 18 tokens
+                "n_layers": 10,
+                "n_heads": 8,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8,
+                "dropout": 0.1
+            },
+            "checkpoint": "Comparing_Mambas_Trans/transformer_balanced.pth"
+        },
+        {
+            "name": "Transformer_522_18token",
+            "model_class": StarClassifierFusionTransformer,
+            "params": {
+                "d_model_spectra": 1536,
+                "d_model_gaia": 1536,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 7,    # ~522 tokens
+                "token_dim_gaia": 1,       # 18 tokens
+                "n_layers": 10,
+                "n_heads": 8,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8,
+                "dropout": 0.1
+            },
+            "checkpoint": "Comparing_Mambas_Trans/transformer_max_tokens.pth"
+        },
+        
+        # Mamba2 Tokenized Models
+        {
+            "name": "Mamba2_1token",
+            "model_class": StarClassifierFusionMambaTokenized,
+            "params": {
+                "d_model_spectra": 2048,
+                "d_model_gaia": 2048,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 3647,  # 1 token
+                "token_dim_gaia": 18,       # 1 token
+                "n_layers": 20,
+                "d_state": 32,
+                "d_conv": 2,
+                "expand": 2,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8
+            },
+            "checkpoint": "Comparing_Mambas_Trans/mamba_1_token.pth"
+        },
+        {
+            "name": "Mamba2_19_18token",
+            "model_class": StarClassifierFusionMambaTokenized,
+            "params": {
+                "d_model_spectra": 2048,
+                "d_model_gaia": 2048,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 192,  # ~19 tokens
+                "token_dim_gaia": 1,       # 18 tokens
+                "n_layers": 20,
+                "d_state": 32,
+                "d_conv": 4,
+                "expand": 2,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8
+            },
+            "checkpoint": "Comparing_Mambas_Trans/mamba_balanced.pth"
+        },
+        {
+            "name": "Mamba2_522_18token",
+            "model_class": StarClassifierFusionMambaTokenized,
+            "params": {
+                "d_model_spectra": 1536,
+                "d_model_gaia": 1536,
+                "num_classes": 55,
+                "input_dim_spectra": 3647,
+                "input_dim_gaia": 18,
+                "token_dim_spectra": 7,    # ~522 tokens
+                "token_dim_gaia": 1,       # 18 tokens
+                "n_layers": 20,
+                "d_state": 16,
+                "d_conv": 4,
+                "expand": 2,
+                "use_cross_attention": True,
+                "n_cross_attn_heads": 8
+            },
+            "checkpoint": "Comparing_Mambas_Trans/mamba_max_tokens.pth"
+        }
+    ]
+    
+    # Store results
+    results = {}
+    
+    # Evaluate each model
+    for config in model_configs:
+        print(f"\n{'='*50}")
+        print(f"Evaluating model: {config['name']}")
+        print(f"{'='*50}")
+        
+        # Create model instance
+        model = config["model_class"](**config["params"])
+        
+        # Load checkpoint if exists
+        checkpoint_path = config["checkpoint"]
+        if os.path.exists(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        else:
+            print(f"Checkpoint {checkpoint_path} not found. Skipping this model.")
+            continue
+        
+        # Move model to device
+        model = model.to(device)
+        
+        # Print model statistics
+        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Number of parameters: {num_params:,}")
+        
+        # Calculate model size in MB
+        param_size = sum(p.nelement() * p.element_size() for p in model.parameters())
+        buffer_size = sum(b.nelement() * b.element_size() for b in model.buffers())
+        size_mb = (param_size + buffer_size) / (1024**2)
+        print(f"Model size: {size_mb:.2f} MB")
+        
+        # Evaluate model
+        metrics = evaluate_model(model, test_loader, device)
+        
+        # Add model info to metrics
+        metrics["model_name"] = config["name"]
+        metrics["num_parameters"] = num_params
+        metrics["model_size_mb"] = size_mb
+        
+        # Get token counts for analysis
+        spectra_tokens = (config["params"]["input_dim_spectra"] + config["params"]["token_dim_spectra"] - 1) // config["params"]["token_dim_spectra"]
+        gaia_tokens = (config["params"]["input_dim_gaia"] + config["params"]["token_dim_gaia"] - 1) // config["params"]["token_dim_gaia"]
+        metrics["spectra_tokens"] = spectra_tokens
+        metrics["gaia_tokens"] = gaia_tokens
+        metrics["total_tokens"] = spectra_tokens + gaia_tokens
+        
+        # Print key metrics
+        print("\nTest Metrics:")
+        print(f"  Loss: {metrics['avg_loss']:.4f}")
+        print(f"  Accuracy: {metrics['avg_accuracy']:.4f}")
+        print(f"  Micro F1: {metrics['micro_f1']:.4f}")
+        print(f"  Macro F1: {metrics['macro_f1']:.4f}")
+        print(f"  Weighted F1: {metrics['weighted_f1']:.4f}")
+        print(f"  Macro AUROC: {metrics.get('macro_auroc', 'N/A')}")
+        
+        # Store results
+        results[config["name"]] = metrics
+        
+        # Clear memory
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # Save results to JSON
+    results_file = os.path.join(results_dir, "model_comparison_results.json")
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    # Convert to DataFrame for easier analysis
+    results_df = pd.DataFrame.from_dict(results, orient='index')
+    
+    # Save DataFrame to CSV
+    csv_file = os.path.join(results_dir, "model_comparison_results.csv")
+    results_df.to_csv(csv_file)
+    
+    # Create model family summary
+    model_families = {
+        "MambaOut": [m for m in results_df.index if m.startswith("MambaOut")],
+        "Transformer": [m for m in results_df.index if m.startswith("Transformer")],
+        "Mamba2": [m for m in results_df.index if m.startswith("Mamba2")]
+    }
+
+    # Print debug information to help identify the issue
+    print("Model families:")
+    for family, models in model_families.items():
+        print(f"  {family}: {models}")
+
+    family_results = {}
+    for family, models in model_families.items():
+        if models:
+            # Check if the models list contains actual model names
+            if all(isinstance(m, str) and m in results_df.index for m in models):
+                # Use only numeric columns for the mean calculation
+                numeric_cols = results_df.select_dtypes(include=['number']).columns
+                family_results[family] = results_df.loc[models, numeric_cols].mean()
+            else:
+                print(f"Warning: Invalid model list for {family}: {models}")
+                # Skip this family or provide default values
+
+    family_df = pd.DataFrame.from_dict(family_results, orient='index')
+    family_csv = os.path.join(results_dir, "model_family_summary.csv")
+    family_df.to_csv(family_csv)
+    
+    # Create comparative visualizations
+    
+    # 1. Performance by model metrics bar chart
+    key_metrics = ['micro_f1', 'macro_f1', 'weighted_f1', 'macro_auroc']
+    plt.figure(figsize=(15, 10))
+    
+    for i, metric in enumerate(key_metrics):
+        if metric in results_df.columns:
+            plt.subplot(2, 2, i+1)
+            sns.barplot(x=results_df.index, y=results_df[metric])
+            plt.title(f"{metric.replace('_', ' ').title()}")
+            plt.xticks(rotation=45, ha='right')
+            plt.ylim(0, 1)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, "key_metrics_comparison.png"))
+    
+    # 2. Performance vs Model Size scatter plot
+    plt.figure(figsize=(12, 8))
+    
+    for family, models in model_families.items():
+        if models:
+            sns.scatterplot(
+                x=results_df.loc[models, 'model_size_mb'], 
+                y=results_df.loc[models, 'macro_f1'],
+                label=family,
+                s=100
+            )
+    
+    for i, model in enumerate(results_df.index):
+        plt.annotate(
+            model,
+            (results_df.loc[model, 'model_size_mb'], results_df.loc[model, 'macro_f1']),
+            xytext=(5, 5),
+            textcoords='offset points'
+        )
+    
+    plt.xlabel("Model Size (MB)")
+    plt.ylabel("Macro F1 Score")
+    plt.title("Model Performance vs Model Size")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(os.path.join(results_dir, "performance_vs_size.png"))
+    
+    # 3. Performance vs Number of Tokens scatter plot
+    plt.figure(figsize=(12, 8))
+    
+    for family, models in model_families.items():
+        if models:
+            sns.scatterplot(
+                x=results_df.loc[models, 'total_tokens'], 
+                y=results_df.loc[models, 'macro_f1'],
+                label=family,
+                s=100
+            )
+    
+    for i, model in enumerate(results_df.index):
+        plt.annotate(
+            model,
+            (results_df.loc[model, 'total_tokens'], results_df.loc[model, 'macro_f1']),
+            xytext=(5, 5),
+            textcoords='offset points'
+        )
+    
+    plt.xscale('log')
+    plt.xlabel("Total Number of Tokens (log scale)")
+    plt.ylabel("Macro F1 Score")
+    plt.title("Model Performance vs Number of Tokens")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(os.path.join(results_dir, "performance_vs_tokens.png"))
+    
+    print(f"\nResults saved to {results_dir}/")
+    print(f"Summary: {family_csv}")
+    
+    # Generate a text summary report
+    with open(os.path.join(results_dir, "summary_report.txt"), 'w') as f:
+        f.write("MODEL EVALUATION SUMMARY\n")
+        f.write("======================\n\n")
+        
+        f.write("Best Models by Metric:\n")
+        for metric in ['micro_f1', 'macro_f1', 'weighted_f1', 'macro_auroc']:
+            if metric in results_df.columns:
+                best_model = results_df[metric].idxmax()
+                f.write(f"  Best {metric}: {best_model} ({results_df.loc[best_model, metric]:.4f})\n")
+        
+        f.write("\nModel Family Comparison:\n")
+        for family, metrics in family_results.items():
+            f.write(f"  {family}:\n")
+            f.write(f"    Macro F1: {metrics['macro_f1']:.4f}\n")
+            f.write(f"    Average Size: {metrics['model_size_mb']:.2f} MB\n")
+        
+        f.write("\nToken Configuration Analysis:\n")
+        token_configs = ["1token", "19_18token", "522_18token"]
+        for config in token_configs:
+            models = [m for m in results_df.index if config in m]
+            if models:
+                config_df = results_df.loc[models]
+                f.write(f"  {config}:\n")
+                f.write(f"    Average Macro F1: {config_df['macro_f1'].mean():.4f}\n")
+                f.write(f"    Best Model: {config_df['macro_f1'].idxmax()} ({config_df['macro_f1'].max():.4f})\n")
+        
+        f.write("\nDetailed Model Rankings:\n")
+        for rank, (model, metrics) in enumerate(results_df.sort_values('macro_f1', ascending=False).iterrows(), 1):
+            f.write(f"  {rank}. {model}:\n")
+            f.write(f"     Macro F1: {metrics['macro_f1']:.4f}\n")
+            f.write(f"     Size: {metrics['model_size_mb']:.2f} MB\n")
+            f.write(f"     Parameters: {metrics['num_parameters']:,}\n")
+            f.write(f"     Token Config: {metrics['spectra_tokens']} spectra, {metrics['gaia_tokens']} gaia\n")
+    
+    print(f"Summary report generated: {results_dir}/summary_report.txt")
+
+if __name__ == "__main__":
+    main()
+
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle, FancyArrowPatch, Circle
+import matplotlib.colors as mcolors
+from graphviz import Digraph
+import os
+
+# Set the output directory for saving diagrams
+os.makedirs('thesis_figures', exist_ok=True)
+
+def visualize_torchviz(model):
+    """
+    Visualize model using torchviz (requires torchviz package).
+    Note: This shows computational graph, not architecture layout.
+    """
+    try:
+        from torchviz import make_dot
+        
+        # Create dummy inputs matching your model's expected input shape
+        dummy_spectra = torch.randn(1, 3647)
+        dummy_gaia = torch.randn(1, 18)
+        
+        # Forward pass to get the graph
+        y = model(dummy_spectra, dummy_gaia)
+        
+        # Create and save dot graph
+        dot = make_dot(y, params=dict(model.named_parameters()))
+        dot.format = 'pdf'
+        dot.render('thesis_figures/model_computational_graph')
+        print("Computational graph saved as 'thesis_figures/model_computational_graph.pdf'")
+    except ImportError:
+        print("torchviz not installed. Install with: pip install torchviz")
+
+def visualize_graphviz(model):
+    """
+    Create a custom visualization using Graphviz
+    """
+    dot = Digraph(comment='StarClassifierFusion Architecture', 
+                 format='pdf', 
+                 node_attr={'shape': 'box', 'style': 'filled', 'fontname': 'Arial'})
+    
+    # Add title
+    dot.attr(label='StarClassifierFusion Neural Network Architecture', labelloc='t', fontsize='20')
+    
+    # Create subgraphs for each section
+    with dot.subgraph(name='cluster_inputs') as c:
+        c.attr(label='Inputs', style='filled', color='lightblue', fontcolor='black')
+        c.node('spectra_input', 'Spectral Input\n(B, 3647)', fillcolor='white')
+        c.node('gaia_input', 'Gaia Input\n(B, 18)', fillcolor='white')
+    
+    # Projection layers
+    dot.node('spectra_proj', 'Linear Projection\n(B, 2048)', fillcolor='#F8CECC')
+    dot.node('gaia_proj', 'Linear Projection\n(B, 2048)', fillcolor='#F8CECC')
+    
+    # Connections from inputs to projections
+    dot.edge('spectra_input', 'spectra_proj')
+    dot.edge('gaia_input', 'gaia_proj')
+    
+    # Reshape (add sequence dimension)
+    dot.node('spectra_reshape', 'Unsqueeze\n(B, 1, 2048)', fillcolor='#D5E8D4')
+    dot.node('gaia_reshape', 'Unsqueeze\n(B, 1, 2048)', fillcolor='#D5E8D4')
+    
+    # Connections to reshape
+    dot.edge('spectra_proj', 'spectra_reshape')
+    dot.edge('gaia_proj', 'gaia_reshape')
+    
+    # Mamba layers
+    with dot.subgraph(name='cluster_mamba_spectra') as c:
+        c.attr(label='Mamba2 Encoder (Spectra)', style='filled', color='#DAE8FC', fontcolor='black')
+        c.node('mamba_spectra', f'Mamba2 Layers × {model.mamba_spectra.__len__()}\n(B, 1, 2048)', fillcolor='white')
+    
+    with dot.subgraph(name='cluster_mamba_gaia') as c:
+        c.attr(label='Mamba2 Encoder (Gaia)', style='filled', color='#DAE8FC', fontcolor='black')
+        c.node('mamba_gaia', f'Mamba2 Layers × {model.mamba_gaia.__len__()}\n(B, 1, 2048)', fillcolor='white')
+    
+    # Connections to Mamba
+    dot.edge('spectra_reshape', 'mamba_spectra')
+    dot.edge('gaia_reshape', 'mamba_gaia')
+    
+    # Cross-attention blocks (if used)
+    if model.use_cross_attention:
+        with dot.subgraph(name='cluster_cross_attn') as c:
+            c.attr(label='Cross-Attention', style='filled', color='#FFE6CC', fontcolor='black')
+            c.node('cross_attn_spectra', 'Cross-Attention\n(Spectra → Gaia)', fillcolor='white')
+            c.node('cross_attn_gaia', 'Cross-Attention\n(Gaia → Spectra)', fillcolor='white')
+        
+        # Connections to cross-attention
+        dot.edge('mamba_spectra', 'cross_attn_spectra')
+        dot.edge('mamba_gaia', 'cross_attn_gaia')
+        dot.edge('mamba_gaia', 'cross_attn_spectra', style='dashed', color='gray')
+        dot.edge('mamba_spectra', 'cross_attn_gaia', style='dashed', color='gray')
+        
+        # Mean pooling after cross-attention
+        dot.node('pool_spectra', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        dot.node('pool_gaia', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        
+        # Connections to pooling
+        dot.edge('cross_attn_spectra', 'pool_spectra')
+        dot.edge('cross_attn_gaia', 'pool_gaia')
+    else:
+        # Direct pooling without cross-attention
+        dot.node('pool_spectra', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        dot.node('pool_gaia', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        
+        # Connections to pooling
+        dot.edge('mamba_spectra', 'pool_spectra')
+        dot.edge('mamba_gaia', 'pool_gaia')
+    
+    # Fusion
+    dot.node('fusion', 'Concatenation\n(B, 4096)', fillcolor='#FFF2CC')
+    
+    # Connections to fusion
+    dot.edge('pool_spectra', 'fusion')
+    dot.edge('pool_gaia', 'fusion')
+    
+    # Final classification
+    dot.node('layer_norm', 'Layer Normalization', fillcolor='#F8CECC')
+    dot.node('classifier', 'Linear Classifier\n(B, 55)', fillcolor='#F8CECC')
+    dot.node('output', 'Output Logits', fillcolor='#E1D5E7')
+    
+    # Final connections
+    dot.edge('fusion', 'layer_norm')
+    dot.edge('layer_norm', 'classifier')
+    dot.edge('classifier', 'output')
+    
+    # Save the diagram
+    dot.render('thesis_figures/model_architecture')
+    print("Architecture diagram saved as 'thesis_figures/model_architecture.pdf'")
+
+def plot_network_matplotlib(model):
+    """
+    Create a custom visualization using matplotlib
+    This gives more control over the appearance
+    """
+    # Set up the figure with a light gray background
+    fig, ax = plt.subplots(figsize=(12, 16), facecolor='#F8F9F9')
+    ax.set_facecolor('#F8F9F9')
+    
+    # Remove axes
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 16)
+    ax.axis('off')
+    
+    # Color scheme
+    colors = {
+        'input': '#D4F1F9',
+        'projection': '#F8FAD7',
+        'mamba': '#E8F8F5',
+        'cross_attn': '#F5EEF8',
+        'pooling': '#D5E8D4',
+        'fusion': '#FADBD8',
+        'output': '#FCF3CF',
+        'arrow': '#05386B'
+    }
+    
+    # Define box dimensions
+    box_width = 2.5
+    box_height = 0.6
+    
+    # Function to add a box with a label
+    def add_box(x, y, label, color, alpha=1.0):
+        rect = Rectangle((x, y), box_width, box_height, 
+                         facecolor=color, edgecolor='#05386B', 
+                         alpha=alpha, linewidth=1.5, zorder=1)
+        ax.add_patch(rect)
+        ax.text(x + box_width/2, y + box_height/2, label, 
+                horizontalalignment='center', verticalalignment='center',
+                fontsize=10, fontweight='bold', zorder=2)
+        return (x + box_width/2, y + box_height/2)  # return center point
+    
+    # Function to add an arrow between boxes
+    def add_arrow(start, end, color='#05386B', linestyle='-', linewidth=1.5):
+        arrow = FancyArrowPatch(start, end, 
+                                arrowstyle='->', color=color, 
+                                linewidth=linewidth, linestyle=linestyle,
+                                connectionstyle='arc3,rad=0.1', zorder=0)
+        ax.add_patch(arrow)
+    
+    # Title
+    plt.title('StarClassifierFusion: Multimodal Architecture with Mamba2 and Cross-Attention', 
+              fontsize=16, fontweight='bold', pad=20)
+    
+    # Add subtitle/description
+    ax.text(5, 15.5, 'A multimodal deep learning model for stellar classification using spectral and Gaia data',
+           horizontalalignment='center', fontsize=12, fontstyle='italic')
+    
+    # Input layers
+    input_spectra = add_box(1.5, 14, 'Spectral Input\n(B, 3647)', colors['input'])
+    input_gaia = add_box(6, 14, 'Gaia Input\n(B, 18)', colors['input'])
+    
+    # Projection layers
+    proj_spectra = add_box(1.5, 13, 'Linear Projection\n(B, 2048)', colors['projection'])
+    proj_gaia = add_box(6, 13, 'Linear Projection\n(B, 2048)', colors['projection'])
+    
+    # Reshape layers
+    reshape_spectra = add_box(1.5, 12, 'Unsqueeze\n(B, 1, 2048)', colors['projection'])
+    reshape_gaia = add_box(6, 12, 'Unsqueeze\n(B, 1, 2048)', colors['projection'])
+    
+    # Mamba blocks
+    # Create a rectangle area for the Mamba subgraph
+    spectra_background = Rectangle((1, 9), 3.5, 2.5, facecolor='#D4E6F1', alpha=0.3, edgecolor='#2874A6', linewidth=1)
+    gaia_background = Rectangle((5.5, 9), 3.5, 2.5, facecolor='#D4E6F1', alpha=0.3, edgecolor='#2874A6', linewidth=1)
+    ax.add_patch(spectra_background)
+    ax.add_patch(gaia_background)
+    
+    # Label for the mamba sections
+    ax.text(2.75, 11.3, f'Mamba2 Encoder (Spectra)', 
+            horizontalalignment='center', fontsize=10, fontstyle='italic')
+    ax.text(7.25, 11.3, f'Mamba2 Encoder (Gaia)', 
+            horizontalalignment='center', fontsize=10, fontstyle='italic')
+    
+    # Individual Mamba layers
+    mamba_spectra1 = add_box(1.5, 10.8, f'Mamba2 Layer 1', colors['mamba'])
+    mamba_spectra2 = add_box(1.5, 10.2, f'Mamba2 Layer 2', colors['mamba'])
+    mamba_spectra_dots = add_box(1.5, 9.6, f'...', 'none')
+    mamba_spectraN = add_box(1.5, 9, f'Mamba2 Layer {model.mamba_spectra.__len__()}', colors['mamba'])
+    
+    mamba_gaia1 = add_box(6, 10.8, f'Mamba2 Layer 1', colors['mamba'])
+    mamba_gaia2 = add_box(6, 10.2, f'Mamba2 Layer 2', colors['mamba'])
+    mamba_gaia_dots = add_box(6, 9.6, f'...', 'none')
+    mamba_gaiaN = add_box(6, 9, f'Mamba2 Layer {model.mamba_gaia.__len__()}', colors['mamba'])
+    
+    # Cross-attention (if used) or direct pooling
+    if model.use_cross_attention:
+        # Create a rectangle area for the cross-attention
+        cross_attn_background = Rectangle((1, 7), 8, 1.5, facecolor='#E8DAEF', alpha=0.3, edgecolor='#8E44AD', linewidth=1)
+        ax.add_patch(cross_attn_background)
+        ax.text(5, 8.3, 'Cross-Attention Fusion', horizontalalignment='center', fontsize=10, fontstyle='italic')
+        
+        cross_attn_spectra = add_box(1.5, 7.5, 'Cross-Attention\n(Spectra → Gaia)', colors['cross_attn'])
+        cross_attn_gaia = add_box(6, 7.5, 'Cross-Attention\n(Gaia → Spectra)', colors['cross_attn'])
+        
+        # Add dashed lines to show cross-connections
+        add_arrow((2.75, 9), (7.75, 7.5), linestyle='--', linewidth=1)
+        add_arrow((7.25, 9), (2.75, 7.5), linestyle='--', linewidth=1)
+        
+        # Pooling layers
+        pool_spectra = add_box(1.5, 6.5, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        pool_gaia = add_box(6, 6.5, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        
+        # Connections
+        add_arrow(input_spectra, proj_spectra)
+        add_arrow(input_gaia, proj_gaia)
+        add_arrow(proj_spectra, reshape_spectra)
+        add_arrow(proj_gaia, reshape_gaia)
+        add_arrow(reshape_spectra, mamba_spectra1)
+        add_arrow(reshape_gaia, mamba_gaia1)
+        add_arrow(mamba_spectra1, mamba_spectra2)
+        add_arrow(mamba_gaia1, mamba_gaia2)
+        add_arrow(mamba_spectra2, mamba_spectra_dots)
+        add_arrow(mamba_gaia2, mamba_gaia_dots)
+        add_arrow(mamba_spectra_dots, mamba_spectraN)
+        add_arrow(mamba_gaia_dots, mamba_gaiaN)
+        add_arrow(mamba_spectraN, cross_attn_spectra)
+        add_arrow(mamba_gaiaN, cross_attn_gaia)
+        add_arrow(cross_attn_spectra, pool_spectra)
+        add_arrow(cross_attn_gaia, pool_gaia)
+    else:
+        # Direct pooling without cross-attention
+        pool_spectra = add_box(1.5, 8, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        pool_gaia = add_box(6, 8, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        
+        # Connections
+        add_arrow(input_spectra, proj_spectra)
+        add_arrow(input_gaia, proj_gaia)
+        add_arrow(proj_spectra, reshape_spectra)
+        add_arrow(proj_gaia, reshape_gaia)
+        add_arrow(reshape_spectra, mamba_spectra1)
+        add_arrow(reshape_gaia, mamba_gaia1)
+        add_arrow(mamba_spectra1, mamba_spectra2)
+        add_arrow(mamba_gaia1, mamba_gaia2)
+        add_arrow(mamba_spectra2, mamba_spectra_dots)
+        add_arrow(mamba_gaia2, mamba_gaia_dots)
+        add_arrow(mamba_spectra_dots, mamba_spectraN)
+        add_arrow(mamba_gaia_dots, mamba_gaiaN)
+        add_arrow(mamba_spectraN, pool_spectra)
+        add_arrow(mamba_gaiaN, pool_gaia)
+    
+    # Fusion and classification
+    fusion = add_box(3.8, 5.5, 'Concatenation\n(B, 4096)', colors['fusion'])
+    norm = add_box(3.8, 4.5, 'Layer Normalization', colors['projection'])
+    classifier = add_box(3.8, 3.5, 'Linear Classifier\n(B, 55)', colors['projection'])
+    output = add_box(3.8, 2.5, 'Output Logits', colors['output'])
+    
+    # Final connections
+    add_arrow(pool_spectra, fusion)
+    add_arrow(pool_gaia, fusion)
+    add_arrow(fusion, norm)
+    add_arrow(norm, classifier)
+    add_arrow(classifier, output)
+    
+    # Add a legend for network components
+    legend_x = 7.5
+    legend_y = 4
+    legend_spacing = 0.7
+    
+    # Legend title
+    ax.text(legend_x, legend_y + 1.2, 'Model Components:', 
+            fontsize=10, fontweight='bold')
+    
+    # Create legend entries
+    legend_items = [
+        ('Input Layer', colors['input']),
+        ('Projection Layer', colors['projection']),
+        ('Mamba2 Block', colors['mamba']),
+        ('Cross-Attention', colors['cross_attn']),
+        ('Pooling Layer', colors['pooling']),
+        ('Fusion Layer', colors['fusion']),
+        ('Output Layer', colors['output'])
+    ]
+    
+    for i, (label, color) in enumerate(legend_items):
+        y_pos = legend_y - i * legend_spacing
+        # Add colored square
+        square = Rectangle((legend_x - 0.4, y_pos - 0.1), 0.3, 0.3, 
+                          facecolor=color, edgecolor='black', linewidth=1)
+        ax.add_patch(square)
+        # Add label
+        ax.text(legend_x, y_pos, label, fontsize=9, 
+                verticalalignment='center')
+    
+    # Add model parameters information
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    ax.text(5, 1.5, f'Total Parameters: {param_count:,}', 
+            horizontalalignment='center', fontsize=10, fontweight='bold')
+    
+    # Add university logo/attribution placeholder
+    ax.text(5, 0.5, 'Your University / Institution Name', 
+            horizontalalignment='center', fontsize=10, fontweight='bold')
+    
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig('thesis_figures/model_architecture_matplotlib.pdf', dpi=300, bbox_inches='tight')
+    plt.savefig('thesis_figures/model_architecture_matplotlib.png', dpi=300, bbox_inches='tight')
+    print("Matplotlib architecture visualization saved as 'thesis_figures/model_architecture_matplotlib.pdf/png'")
+
+def generate_model_description():
+    """
+    Generate a professional description of the model architecture for the thesis.
+    """
+    description = """
+## 3.5.1 Model Architecture Overview: StarClassifierFusion
+
+The **StarClassifierFusion** model is a multimodal deep learning architecture designed to leverage both spectral and Gaia astrometric data for stellar classification. The model employs parallel processing branches for different data modalities, with optional cross-modal interaction capabilities, followed by late fusion for final classification.
+
+### Key Components
+
+1. **Dual Modality Encoders**: 
+   * **Spectral Branch**: Processes high-dimensional spectral data (3,647 features) through a dedicated encoder.
+   * **Gaia Branch**: Processes lower-dimensional astrometric data (18 features) through a separate encoder.
+
+2. **Mamba2 Backbone**:
+   * Both branches utilize Mamba2 layers, a state-of-the-art sequence modeling architecture that combines the efficiency of linear recurrent models with the expressivity of attention-based models.
+   * Each branch consists of {n_layers} stacked Mamba2 layers with {d_model} hidden dimensions.
+
+3. **Cross-Attention Mechanism**:
+   * Facilitates information exchange between the two modality branches.
+   * **Spectra-to-Gaia Attention**: The spectral branch attends to relevant features in the Gaia branch.
+   * **Gaia-to-Spectra Attention**: The Gaia branch attends to relevant features in the spectral branch.
+   * Each cross-attention block employs multi-head attention with {n_heads} heads and residual connections with layer normalization.
+
+4. **Late Fusion**:
+   * Concatenation of the processed features from both branches results in a joint representation with {fusion_dim} dimensions.
+   * Layer normalization is applied to the concatenated features for stable training.
+
+5. **Classification Head**:
+   * A linear layer maps the fused representation to {num_classes} output logits corresponding to different stellar classes.
+
+### Technical Specifications
+
+* **Input Dimensions**:
+  * Spectral data: B × {input_dim_spectra} (where B is batch size)
+  * Gaia data: B × {input_dim_gaia}
+  
+* **Embedding Dimensions**:
+  * Spectral branch: {d_model_spectra}
+  * Gaia branch: {d_model_gaia}
+  
+* **Mamba2 Configuration**:
+  * State dimension: {d_state}
+  * Convolution kernel size: {d_conv}
+  * Expansion factor: {expand}
+
+* **Model Size**:
+  * Total parameters: {param_count:,}
+  * Model size: {model_size:.2f} MB
+
+### Design Rationale
+
+This architecture was designed to effectively capture both the fine-grained spectral features and the complementary astrometric information from Gaia, while enabling cross-modal interaction through the attention mechanism. The Mamba2 backbone was selected for its efficiency in processing sequence data compared to Transformer models, while maintaining competitive performance.
+
+The cross-attention fusion strategy allows the model to learn which features from one modality are most relevant to the other, enabling more effective multimodal learning than simple late fusion approaches. This is particularly important for stellar classification where certain spectral features may be more informative when considered in conjunction with specific astrometric properties.
+"""
+    
+    # Save the description to a file
+    with open('thesis_figures/model_description.md', 'w') as f:
+        f.write(description)
+    
+    print("Model description saved as 'thesis_figures/model_description.md'")
+    return description
+
+def visualize_star_classifier_fusion(model):
+    """
+    Generate all visualizations and descriptions for the StarClassifierFusion model
+    """
+    # Create visualizations
+    visualize_graphviz(model)
+    plot_network_matplotlib(model)
+    
+    # Try to create computational graph if torchviz is available
+    try:
+        visualize_torchviz(model)
+    except Exception as e:
+        print(f"Could not create computational graph: {e}")
+    
+    # Generate description
+    description = generate_model_description()
+    
+    # Replace placeholder values with actual model parameters
+    description = description.format(
+        n_layers=model.mamba_spectra.__len__(),
+        d_model=max(model.input_proj_spectra.out_features, model.input_proj_gaia.out_features),
+        d_model_spectra=model.input_proj_spectra.out_features,
+        d_model_gaia=model.input_proj_gaia.out_features,
+        n_heads=8,  # Assuming this from the model code
+        fusion_dim=model.input_proj_spectra.out_features + model.input_proj_gaia.out_features,
+        num_classes=model.classifier[-1].out_features,import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle, FancyArrowPatch, Circle
+import matplotlib.colors as mcolors
+from graphviz import Digraph
+import os
+
+# Set the output directory for saving diagrams
+os.makedirs('thesis_figures', exist_ok=True)
+
+def visualize_torchviz(model):
+    """
+    Visualize model using torchviz (requires torchviz package).
+    Note: This shows computational graph, not architecture layout.
+    """
+    try:
+        from torchviz import make_dot
+        
+        # Create dummy inputs matching your model's expected input shape
+        dummy_spectra = torch.randn(1, 3647)
+        dummy_gaia = torch.randn(1, 18)
+        
+        # Forward pass to get the graph
+        y = model(dummy_spectra, dummy_gaia)
+        
+        # Create and save dot graph
+        dot = make_dot(y, params=dict(model.named_parameters()))
+        dot.format = 'pdf'
+        dot.render('thesis_figures/model_computational_graph')
+        print("Computational graph saved as 'thesis_figures/model_computational_graph.pdf'")
+    except ImportError:
+        print("torchviz not installed. Install with: pip install torchviz")
+
+def visualize_graphviz(model):
+    """
+    Create a custom visualization using Graphviz
+    """
+    dot = Digraph(comment='StarClassifierFusion Architecture', 
+                 format='pdf', 
+                 node_attr={'shape': 'box', 'style': 'filled', 'fontname': 'Arial'})
+    
+    # Add title
+    dot.attr(label='StarClassifierFusion Neural Network Architecture', labelloc='t', fontsize='20')
+    
+    # Create subgraphs for each section
+    with dot.subgraph(name='cluster_inputs') as c:
+        c.attr(label='Inputs', style='filled', color='lightblue', fontcolor='black')
+        c.node('spectra_input', 'Spectral Input\n(B, 3647)', fillcolor='white')
+        c.node('gaia_input', 'Gaia Input\n(B, 18)', fillcolor='white')
+    
+    # Projection layers
+    dot.node('spectra_proj', 'Linear Projection\n(B, 2048)', fillcolor='#F8CECC')
+    dot.node('gaia_proj', 'Linear Projection\n(B, 2048)', fillcolor='#F8CECC')
+    
+    # Connections from inputs to projections
+    dot.edge('spectra_input', 'spectra_proj')
+    dot.edge('gaia_input', 'gaia_proj')
+    
+    # Reshape (add sequence dimension)
+    dot.node('spectra_reshape', 'Unsqueeze\n(B, 1, 2048)', fillcolor='#D5E8D4')
+    dot.node('gaia_reshape', 'Unsqueeze\n(B, 1, 2048)', fillcolor='#D5E8D4')
+    
+    # Connections to reshape
+    dot.edge('spectra_proj', 'spectra_reshape')
+    dot.edge('gaia_proj', 'gaia_reshape')
+    
+    # Mamba layers
+    with dot.subgraph(name='cluster_mamba_spectra') as c:
+        c.attr(label='Mamba2 Encoder (Spectra)', style='filled', color='#DAE8FC', fontcolor='black')
+        c.node('mamba_spectra', f'Mamba2 Layers × {model.mamba_spectra.__len__()}\n(B, 1, 2048)', fillcolor='white')
+    
+    with dot.subgraph(name='cluster_mamba_gaia') as c:
+        c.attr(label='Mamba2 Encoder (Gaia)', style='filled', color='#DAE8FC', fontcolor='black')
+        c.node('mamba_gaia', f'Mamba2 Layers × {model.mamba_gaia.__len__()}\n(B, 1, 2048)', fillcolor='white')
+    
+    # Connections to Mamba
+    dot.edge('spectra_reshape', 'mamba_spectra')
+    dot.edge('gaia_reshape', 'mamba_gaia')
+    
+    # Cross-attention blocks (if used)
+    if model.use_cross_attention:
+        with dot.subgraph(name='cluster_cross_attn') as c:
+            c.attr(label='Cross-Attention', style='filled', color='#FFE6CC', fontcolor='black')
+            c.node('cross_attn_spectra', 'Cross-Attention\n(Spectra → Gaia)', fillcolor='white')
+            c.node('cross_attn_gaia', 'Cross-Attention\n(Gaia → Spectra)', fillcolor='white')
+        
+        # Connections to cross-attention
+        dot.edge('mamba_spectra', 'cross_attn_spectra')
+        dot.edge('mamba_gaia', 'cross_attn_gaia')
+        dot.edge('mamba_gaia', 'cross_attn_spectra', style='dashed', color='gray')
+        dot.edge('mamba_spectra', 'cross_attn_gaia', style='dashed', color='gray')
+        
+        # Mean pooling after cross-attention
+        dot.node('pool_spectra', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        dot.node('pool_gaia', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        
+        # Connections to pooling
+        dot.edge('cross_attn_spectra', 'pool_spectra')
+        dot.edge('cross_attn_gaia', 'pool_gaia')
+    else:
+        # Direct pooling without cross-attention
+        dot.node('pool_spectra', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        dot.node('pool_gaia', 'Mean Pooling\n(B, 2048)', fillcolor='#D5E8D4')
+        
+        # Connections to pooling
+        dot.edge('mamba_spectra', 'pool_spectra')
+        dot.edge('mamba_gaia', 'pool_gaia')
+    
+    # Fusion
+    dot.node('fusion', 'Concatenation\n(B, 4096)', fillcolor='#FFF2CC')
+    
+    # Connections to fusion
+    dot.edge('pool_spectra', 'fusion')
+    dot.edge('pool_gaia', 'fusion')
+    
+    # Final classification
+    dot.node('layer_norm', 'Layer Normalization', fillcolor='#F8CECC')
+    dot.node('classifier', 'Linear Classifier\n(B, 55)', fillcolor='#F8CECC')
+    dot.node('output', 'Output Logits', fillcolor='#E1D5E7')
+    
+    # Final connections
+    dot.edge('fusion', 'layer_norm')
+    dot.edge('layer_norm', 'classifier')
+    dot.edge('classifier', 'output')
+    
+    # Save the diagram
+    dot.render('thesis_figures/model_architecture')
+    print("Architecture diagram saved as 'thesis_figures/model_architecture.pdf'")
+
+def plot_network_matplotlib(model):
+    """
+    Create a custom visualization using matplotlib
+    This gives more control over the appearance
+    """
+    # Set up the figure with a light gray background
+    fig, ax = plt.subplots(figsize=(12, 16), facecolor='#F8F9F9')
+    ax.set_facecolor('#F8F9F9')
+    
+    # Remove axes
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 16)
+    ax.axis('off')
+    
+    # Color scheme
+    colors = {
+        'input': '#D4F1F9',
+        'projection': '#F8FAD7',
+        'mamba': '#E8F8F5',
+        'cross_attn': '#F5EEF8',
+        'pooling': '#D5E8D4',
+        'fusion': '#FADBD8',
+        'output': '#FCF3CF',
+        'arrow': '#05386B'
+    }
+    
+    # Define box dimensions
+    box_width = 2.5
+    box_height = 0.6
+    
+    # Function to add a box with a label
+    def add_box(x, y, label, color, alpha=1.0):
+        rect = Rectangle((x, y), box_width, box_height, 
+                         facecolor=color, edgecolor='#05386B', 
+                         alpha=alpha, linewidth=1.5, zorder=1)
+        ax.add_patch(rect)
+        ax.text(x + box_width/2, y + box_height/2, label, 
+                horizontalalignment='center', verticalalignment='center',
+                fontsize=10, fontweight='bold', zorder=2)
+        return (x + box_width/2, y + box_height/2)  # return center point
+    
+    # Function to add an arrow between boxes
+    def add_arrow(start, end, color='#05386B', linestyle='-', linewidth=1.5):
+        arrow = FancyArrowPatch(start, end, 
+                                arrowstyle='->', color=color, 
+                                linewidth=linewidth, linestyle=linestyle,
+                                connectionstyle='arc3,rad=0.1', zorder=0)
+        ax.add_patch(arrow)
+    
+    # Title
+    plt.title('StarClassifierFusion: Multimodal Architecture with Mamba2 and Cross-Attention', 
+              fontsize=16, fontweight='bold', pad=20)
+    
+    # Add subtitle/description
+    ax.text(5, 15.5, 'A multimodal deep learning model for stellar classification using spectral and Gaia data',
+           horizontalalignment='center', fontsize=12, fontstyle='italic')
+    
+    # Input layers
+    input_spectra = add_box(1.5, 14, 'Spectral Input\n(B, 3647)', colors['input'])
+    input_gaia = add_box(6, 14, 'Gaia Input\n(B, 18)', colors['input'])
+    
+    # Projection layers
+    proj_spectra = add_box(1.5, 13, 'Linear Projection\n(B, 2048)', colors['projection'])
+    proj_gaia = add_box(6, 13, 'Linear Projection\n(B, 2048)', colors['projection'])
+    
+    # Reshape layers
+    reshape_spectra = add_box(1.5, 12, 'Unsqueeze\n(B, 1, 2048)', colors['projection'])
+    reshape_gaia = add_box(6, 12, 'Unsqueeze\n(B, 1, 2048)', colors['projection'])
+    
+    # Mamba blocks
+    # Create a rectangle area for the Mamba subgraph
+    spectra_background = Rectangle((1, 9), 3.5, 2.5, facecolor='#D4E6F1', alpha=0.3, edgecolor='#2874A6', linewidth=1)
+    gaia_background = Rectangle((5.5, 9), 3.5, 2.5, facecolor='#D4E6F1', alpha=0.3, edgecolor='#2874A6', linewidth=1)
+    ax.add_patch(spectra_background)
+    ax.add_patch(gaia_background)
+    
+    # Label for the mamba sections
+    ax.text(2.75, 11.3, f'Mamba2 Encoder (Spectra)', 
+            horizontalalignment='center', fontsize=10, fontstyle='italic')
+    ax.text(7.25, 11.3, f'Mamba2 Encoder (Gaia)', 
+            horizontalalignment='center', fontsize=10, fontstyle='italic')
+    
+    # Individual Mamba layers
+    mamba_spectra1 = add_box(1.5, 10.8, f'Mamba2 Layer 1', colors['mamba'])
+    mamba_spectra2 = add_box(1.5, 10.2, f'Mamba2 Layer 2', colors['mamba'])
+    mamba_spectra_dots = add_box(1.5, 9.6, f'...', 'none')
+    mamba_spectraN = add_box(1.5, 9, f'Mamba2 Layer {model.mamba_spectra.__len__()}', colors['mamba'])
+    
+    mamba_gaia1 = add_box(6, 10.8, f'Mamba2 Layer 1', colors['mamba'])
+    mamba_gaia2 = add_box(6, 10.2, f'Mamba2 Layer 2', colors['mamba'])
+    mamba_gaia_dots = add_box(6, 9.6, f'...', 'none')
+    mamba_gaiaN = add_box(6, 9, f'Mamba2 Layer {model.mamba_gaia.__len__()}', colors['mamba'])
+    
+    # Cross-attention (if used) or direct pooling
+    if model.use_cross_attention:
+        # Create a rectangle area for the cross-attention
+        cross_attn_background = Rectangle((1, 7), 8, 1.5, facecolor='#E8DAEF', alpha=0.3, edgecolor='#8E44AD', linewidth=1)
+        ax.add_patch(cross_attn_background)
+        ax.text(5, 8.3, 'Cross-Attention Fusion', horizontalalignment='center', fontsize=10, fontstyle='italic')
+        
+        cross_attn_spectra = add_box(1.5, 7.5, 'Cross-Attention\n(Spectra → Gaia)', colors['cross_attn'])
+        cross_attn_gaia = add_box(6, 7.5, 'Cross-Attention\n(Gaia → Spectra)', colors['cross_attn'])
+        
+        # Add dashed lines to show cross-connections
+        add_arrow((2.75, 9), (7.75, 7.5), linestyle='--', linewidth=1)
+        add_arrow((7.25, 9), (2.75, 7.5), linestyle='--', linewidth=1)
+        
+        # Pooling layers
+        pool_spectra = add_box(1.5, 6.5, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        pool_gaia = add_box(6, 6.5, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        
+        # Connections
+        add_arrow(input_spectra, proj_spectra)
+        add_arrow(input_gaia, proj_gaia)
+        add_arrow(proj_spectra, reshape_spectra)
+        add_arrow(proj_gaia, reshape_gaia)
+        add_arrow(reshape_spectra, mamba_spectra1)
+        add_arrow(reshape_gaia, mamba_gaia1)
+        add_arrow(mamba_spectra1, mamba_spectra2)
+        add_arrow(mamba_gaia1, mamba_gaia2)
+        add_arrow(mamba_spectra2, mamba_spectra_dots)
+        add_arrow(mamba_gaia2, mamba_gaia_dots)
+        add_arrow(mamba_spectra_dots, mamba_spectraN)
+        add_arrow(mamba_gaia_dots, mamba_gaiaN)
+        add_arrow(mamba_spectraN, cross_attn_spectra)
+        add_arrow(mamba_gaiaN, cross_attn_gaia)
+        add_arrow(cross_attn_spectra, pool_spectra)
+        add_arrow(cross_attn_gaia, pool_gaia)
+    else:
+        # Direct pooling without cross-attention
+        pool_spectra = add_box(1.5, 8, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        pool_gaia = add_box(6, 8, 'Mean Pooling\n(B, 2048)', colors['pooling'])
+        
+        # Connections
+        add_arrow(input_spectra, proj_spectra)
+        add_arrow(input_gaia, proj_gaia)
+        add_arrow(proj_spectra, reshape_spectra)
+        add_arrow(proj_gaia, reshape_gaia)
+        add_arrow(reshape_spectra, mamba_spectra1)
+        add_arrow(reshape_gaia, mamba_gaia1)
+        add_arrow(mamba_spectra1, mamba_spectra2)
+        add_arrow(mamba_gaia1, mamba_gaia2)
+        add_arrow(mamba_spectra2, mamba_spectra_dots)
+        add_arrow(mamba_gaia2, mamba_gaia_dots)
+        add_arrow(mamba_spectra_dots, mamba_spectraN)
+        add_arrow(mamba_gaia_dots, mamba_gaiaN)
+        add_arrow(mamba_spectraN, pool_spectra)
+        add_arrow(mamba_gaiaN, pool_gaia)
+    
+    # Fusion and classification
+    fusion = add_box(3.8, 5.5, 'Concatenation\n(B, 4096)', colors['fusion'])
+    norm = add_box(3.8, 4.5, 'Layer Normalization', colors['projection'])
+    classifier = add_box(3.8, 3.5, 'Linear Classifier\n(B, 55)', colors['projection'])
+    output = add_box(3.8, 2.5, 'Output Logits', colors['output'])
+    
+    # Final connections
+    add_arrow(pool_spectra, fusion)
+    add_arrow(pool_gaia, fusion)
+    add_arrow(fusion, norm)
+    add_arrow(norm, classifier)
+    add_arrow(classifier, output)
+    
+    # Add a legend for network components
+    legend_x = 7.5
+    legend_y = 4
+    legend_spacing = 0.7
+    
+    # Legend title
+    ax.text(legend_x, legend_y + 1.2, 'Model Components:', 
+            fontsize=10, fontweight='bold')
+    
+    # Create legend entries
+    legend_items = [
+        ('Input Layer', colors['input']),
+        ('Projection Layer', colors['projection']),
+        ('Mamba2 Block', colors['mamba']),
+        ('Cross-Attention', colors['cross_attn']),
+        ('Pooling Layer', colors['pooling']),
+        ('Fusion Layer', colors['fusion']),
+        ('Output Layer', colors['output'])
+    ]
+    
+    for i, (label, color) in enumerate(legend_items):
+        y_pos = legend_y - i * legend_spacing
+        # Add colored square
+        square = Rectangle((legend_x - 0.4, y_pos - 0.1), 0.3, 0.3, 
+                          facecolor=color, edgecolor='black', linewidth=1)
+        ax.add_patch(square)
+        # Add label
+        ax.text(legend_x, y_pos, label, fontsize=9, 
+                verticalalignment='center')
+    
+    # Add model parameters information
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    ax.text(5, 1.5, f'Total Parameters: {param_count:,}', 
+            horizontalalignment='center', fontsize=10, fontweight='bold')
+    
+    # Add university logo/attribution placeholder
+    ax.text(5, 0.5, 'Your University / Institution Name', 
+            horizontalalignment='center', fontsize=10, fontweight='bold')
+    
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig('thesis_figures/model_architecture_matplotlib.pdf', dpi=300, bbox_inches='tight')
+    plt.savefig('thesis_figures/model_architecture_matplotlib.png', dpi=300, bbox_inches='tight')
+    print("Matplotlib architecture visualization saved as 'thesis_figures/model_architecture_matplotlib.pdf/png'")
+
+def generate_model_description():
+    """
+    Generate a professional description of the model architecture for the thesis.
+    """
+    description = """
+## 3.5.1 Model Architecture Overview: StarClassifierFusion
+
+The **StarClassifierFusion** model is a multimodal deep learning architecture designed to leverage both spectral and Gaia astrometric data for stellar classification. The model employs parallel processing branches for different data modalities, with optional cross-modal interaction capabilities, followed by late fusion for final classification.
+
+### Key Components
+
+1. **Dual Modality Encoders**: 
+   * **Spectral Branch**: Processes high-dimensional spectral data (3,647 features) through a dedicated encoder.
+   * **Gaia Branch**: Processes lower-dimensional astrometric data (18 features) through a separate encoder.
+
+2. **Mamba2 Backbone**:
+   * Both branches utilize Mamba2 layers, a state-of-the-art sequence modeling architecture that combines the efficiency of linear recurrent models with the expressivity of attention-based models.
+   * Each branch consists of {n_layers} stacked Mamba2 layers with {d_model} hidden dimensions.
+
+3. **Cross-Attention Mechanism**:
+   * Facilitates information exchange between the two modality branches.
+   * **Spectra-to-Gaia Attention**: The spectral branch attends to relevant features in the Gaia branch.
+   * **Gaia-to-Spectra Attention**: The Gaia branch attends to relevant features in the spectral branch.
+   * Each cross-attention block employs multi-head attention with {n_heads} heads and residual connections with layer normalization.
+
+4. **Late Fusion**:
+   * Concatenation of the processed features from both branches results in a joint representation with {fusion_dim} dimensions.
+   * Layer normalization is applied to the concatenated features for stable training.
+
+5. **Classification Head**:
+   * A linear layer maps the fused representation to {num_classes} output logits corresponding to different stellar classes.
+
+### Technical Specifications
+
+* **Input Dimensions**:
+  * Spectral data: B × {input_dim_spectra} (where B is batch size)
+  * Gaia data: B × {input_dim_gaia}
+  
+* **Embedding Dimensions**:
+  * Spectral branch: {d_model_spectra}
+  * Gaia branch: {d_model_gaia}
+  
+* **Mamba2 Configuration**:
+  * State dimension: {d_state}
+  * Convolution kernel size: {d_conv}
+  * Expansion factor: {expand}
+
+* **Model Size**:
+  * Total parameters: {param_count:,}
+  * Model size: {model_size:.2f} MB
+
+### Design Rationale
+
+This architecture was designed to effectively capture both the fine-grained spectral features and the complementary astrometric information from Gaia, while enabling cross-modal interaction through the attention mechanism. The Mamba2 backbone was selected for its efficiency in processing sequence data compared to Transformer models, while maintaining competitive performance.
+
+The cross-attention fusion strategy allows the model to learn which features from one modality are most relevant to the other, enabling more effective multimodal learning than simple late fusion approaches. This is particularly important for stellar classification where certain spectral features may be more informative when considered in conjunction with specific astrometric properties.
+"""
+    
+    # Save the description to a file
+    with open('thesis_figures/model_description.md', 'w') as f:
+        f.write(description)
+    
+    print("Model description saved as 'thesis_figures/model_description.md'")
+    return description
+
+def visualize_star_classifier_fusion(model):
+    """
+    Generate all visualizations and descriptions for the StarClassifierFusion model
+    """
+    # Create visualizations
+    visualize_graphviz(model)
+    plot_network_matplotlib(model)
+    
+    # Try to create computational graph if torchviz is available
+    try:
+        visualize_torchviz(model)
+    except Exception as e:
+        print(f"Could not create computational graph: {e}")
+    
+    # Generate description
+    description = generate_model_description()
+    
+    # Replace placeholder values with actual model parameters
+    description = description.format(
+        n_layers=model.mamba_spectra.__len__(),
+        d_model=max(model.input_proj_spectra.out_features, model.input_proj_gaia.out_features),
+        d_model_spectra=model.input_proj_spectra.out_features,
+        d_model_gaia=model.input_proj_gaia.out_features,
+        n_heads=8,  # Assuming this from the model code
+        fusion_dim=model.input_proj_spectra.out_features + model.input_proj_gaia.out_features,
+        num_classes=model.classifier[-1].out_features,
+        input_dim_spectra=model.input_proj_spectra.in_features,
+        input_dim_gaia=model.input_proj_gaia.in_features,
+        d_state=256,  # From model defaults
+        d_conv=4,     # From model defaults
+        expand=2,     # From model defaults
+        param_count=sum(p.numel() for p in model.parameters() if p.requires_grad),
+        model_size=sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2)
+    )
+    
+    # Save the formatted description
+    with open('thesis_figures/model_description_formatted.md', 'w') as f:
+        f.write(description)
+    
+    print("All visualizations and descriptions generated successfully!")
+    return description
+
+# Example usage (should be replaced with actual model instance)
+# visualize_star_classifier_fusion(your_model_instance)
+
+# If you want to use this script with your model, run:
+# ----------------------------------------------------------------
+# from your_model_file import StarClassifierFusion, CrossAttentionBlock
+# 
+# # Create model instance with your parameters
+# model = StarClassifierFusion(
+#     d_model_spectra=2048,
+#     d_model_gaia=2048,
+#     num_classes=55,
+#     input_dim_spectra=3647,
+#     input_dim_gaia=18,
+#     n_layers=12,
+#     use_cross_attention=True,
+#     n_cross_attn_heads=8
+# )
+# 
+# # Generate all visualizations
+# visualize_star_classifier_fusion(model)
+# ----------------------------------------------------------------
+        param_count=sum(p.numel() for p in model.parameters() if p.requires_grad),
+        model_size=sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2)
+    )
+    
+    # Save the formatted description
+    with open('thesis_figures/model_description_formatted.md', 'w') as f:
+        f.write(description)
+    
+    print("All visualizations and descriptions generated successfully!")
+    return description
+
+# Example usage (should be replaced with actual model instance)
+# visualize_star_classifier_fusion(your_model_instance)
+
+# If you want to use this script with your model, run:
+# ----------------------------------------------------------------
+# from your_model_file import StarClassifierFusion, CrossAttentionBlock
+# 
+# # Create model instance with your parameters
+# model = StarClassifierFusion(
+#     d_model_spectra=2048,
+#     d_model_gaia=2048,
+#     num_classes=55,
+#     input_dim_spectra=3647,
+#     input_dim_gaia=18,
+#     n_layers=12,
+#     use_cross_attention=True,
+#     n_cross_attn_heads=8
+# )
+# 
+# # Generate all visualizations
+# visualize_star_classifier_fusion(model)
+# ----------------------------------------------------------------
