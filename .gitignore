@@ -4,6 +4,8 @@
 *.csv
 *.fits
 *.keras
+*.pdf
+*.png
 gal_spectra/
 star_spectra/
 bin_spectra/
