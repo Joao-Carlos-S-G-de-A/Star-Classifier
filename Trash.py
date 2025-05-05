@@ -9432,3 +9432,269 @@ def visualize_star_classifier_fusion(model):
 # # Generate all visualizations
 # visualize_star_classifier_fusion(model)
 # ----------------------------------------------------------------
+
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+import gzip
+import io
+import os
+
+def add_vertical_line_between_groups(ax, labels):
+    """
+    Draws a vertical dashed line on the provided axis between the error and flux groups.
+    
+    :param ax: The matplotlib axes object where the bar chart is plotted.
+    :param labels: List of labels for the bars, ordered such that error columns come first and flux columns second.
+    """
+    # Count the number of error bars (assumes errors come first)
+    num_error = sum(1 for label in labels if label.endswith("_error"))
+    if num_error and num_error < len(labels):
+        # Vertical line placed between the last error and the first flux bar
+        separation_index = num_error - 0.5
+        ax.axvline(x=separation_index, color='black', linestyle='--', linewidth=5)
+
+
+def open_fits_file(file_path):
+    """
+    Opens a FITS file, handling both regular and gzipped formats.
+    
+    :param file_path: Path to the FITS file
+    :return: FITS HDU list or None if there was an error
+    """
+    try:
+        # Check if the file is gzipped
+        with open(file_path, 'rb') as f:
+            file_start = f.read(2)
+            f.seek(0)  # Reset file pointer
+            if file_start == b'\x1f\x8b':  # gzip magic number
+                # Handle gzipped file
+                with gzip.GzipFile(fileobj=f) as gz_f:
+                    file_content = gz_f.read()
+                print(f"Opening gzipped file: {file_path}")
+                return fits.open(io.BytesIO(file_content), ignore_missing_simple=True)
+            else:
+                # Handle regular file
+                print(f"Opening regular file: {file_path}")
+                return fits.open(file_path, ignore_missing_simple=True)
+    except Exception as e:
+        print(f"Error opening file {os.path.basename(file_path)}: {str(e)}")
+        return None
+
+def plot_spectrum_with_gaia_and_cmd(source_id, gaia_lamost_merged, df_sample, correct_df, incorrect_df, n,
+                                    spectra_folder="lamost_spectra_uniques", save_path=None):
+    """
+    Plots the LAMOST spectrum, the Gaia parameters with issues, and a Color–Magnitude Diagram (CMD) 
+    in a single figure with three subplots.
+    
+    :param source_id: Gaia Source ID of the incorrectly classified source.
+    :param gaia_lamost_merged: DataFrame containing Gaia and LAMOST cross-matched data.
+    :param df_sample: DataFrame containing Gaia photometric and parallax data for the CMD.
+    :param correct_df: DataFrame containing correctly classified Gaia IDs.
+    :param incorrect_df: DataFrame containing incorrectly classified Gaia IDs.
+    :param spectra_folder: Path to the folder containing LAMOST FITS spectra.
+    :param save_path: If provided, the complete figure is saved to this path.
+    """
+    try:
+        if 'obsid' not in gaia_lamost_merged.columns:
+            print("⚠️ 'obsid' column not found in gaia_lamost_merged.")
+            return
+
+        match = gaia_lamost_merged.loc[gaia_lamost_merged['source_id'] == source_id]
+        if match.empty:
+            print(f"⚠️ No LAMOST match found for source_id {source_id}.")
+            return
+
+        obsid = int(match.iloc[0]['obsid'])
+        print(f"Found match: Source ID {source_id} -> ObsID {obsid}")
+
+        fits_path = f"{spectra_folder}/{int(obsid)}"
+        
+        # Use the open_fits_file function to handle both regular and gzipped FITS files
+        hdul = open_fits_file(fits_path)
+        
+        if hdul is None:
+            print(f"⚠️ Failed to open FITS file for ObsID {obsid}.")
+            return
+            
+        # Process the FITS data
+        try:
+            # After opening the FITS file, add debugging:
+            print(f"FITS file structure for ObsID {obsid}:")
+            for i, hdu in enumerate(hdul):
+                print(f"  HDU {i}: {hdu.__class__.__name__}, shape={getattr(hdu.data, 'shape', 'No data')}")
+            
+            # LAMOST DR5 and later uses BinTableHDU in the first extension
+            if len(hdul) > 1 and isinstance(hdul[1], fits.BinTableHDU):
+                print("Using data from BinTableHDU (extension 1)")
+                table_data = hdul[1].data
+                
+                # Debug table column names
+                print(f"  BinTable columns: {table_data.names}")
+                
+                # For LAMOST spectra, typical column names are 'FLUX', 'WAVELENGTH', 'LOGLAM', etc.
+                # Use appropriate column names based on what's available
+                if 'FLUX' in table_data.names and 'WAVELENGTH' in table_data.names:
+                    flux = table_data['FLUX'][0]  # First row
+                    wavelength = table_data['WAVELENGTH'][0]
+                    print(f"  Using FLUX and WAVELENGTH columns")
+                elif 'FLUX' in table_data.names and 'LOGLAM' in table_data.names:
+                    flux = table_data['FLUX'][0]  # First row
+                    # Convert log wavelength to linear wavelength
+                    log_wavelength = table_data['LOGLAM'][0]
+                    wavelength = 10**log_wavelength
+                    print(f"  Using FLUX and LOGLAM (converted) columns")
+                # Add more conditions for different column naming conventions
+                else:
+                    # If column names don't match known formats, try first two columns
+                    # (often wavelength is first, flux is second)
+                    print(f"  Unknown column format, using first two columns")
+                    wavelength = table_data[table_data.names[0]][0]
+                    flux = table_data[table_data.names[1]][0]
+            # Fallback to original method with primary HDU
+            elif hdul[0].data is not None and len(hdul[0].data.shape) >= 1:
+                print("Using data from PrimaryHDU")
+                data = hdul[0].data
+                if data.shape[0] < 3:
+                    print(f"⚠️ Skipping {obsid}: Primary HDU data has insufficient dimensions: {data.shape}")
+                    return
+                flux = data[0]
+                wavelength = data[2]
+            else:
+                print(f"⚠️ Skipping {obsid}: No usable data found in FITS file.")
+                return
+                
+            # Check that we have valid data before proceeding
+            if flux is None or wavelength is None or len(flux) == 0 or len(wavelength) == 0:
+                print(f"⚠️ Skipping {obsid}: Empty flux or wavelength arrays")
+                return
+                
+            print(f"  Data loaded successfully. Wavelength range: {min(wavelength):.2f}-{max(wavelength):.2f} Å")
+            print(f"  Flux range: {min(flux):.2e}-{max(flux):.2e}")
+            
+            # Create a figure with three subplots using GridSpec.
+            # Top row: two subplots (spectrum and Gaia issues), Bottom row: CMD spanning full width.
+            fig = plt.figure(figsize=(24, 12))
+            gs = fig.add_gridspec(1, 3, height_ratios=[1])
+            ax1 = fig.add_subplot(gs[0, 1])
+            ax2 = fig.add_subplot(gs[0, 2])
+            ax3 = fig.add_subplot(gs[0, 0])
+            plt.rcParams.update({'font.size': 16})
+
+            # --- Subplot 1: LAMOST Spectrum ---
+            ax1.plot(wavelength, flux, color='blue', alpha=0.7, lw=1, zorder=10)
+            ax1.set_xlabel("Wavelength (Å)")
+            ax1.set_ylabel("Flux")
+            ax1.set_title(f"LAMOST Spectrum for Unlabelled CV")
+            ax1.grid(zorder=0)
+
+            # --- Subplot 2: Gaia Parameters with Issues ---
+            ax2.grid(zorder=0)
+            gaia_info = match.iloc[[0]].drop(columns=["source_id", "obsid"], errors='ignore')
+            issues_dict = {}
+            issues_text_list = []
+            for col in gaia_info.columns:
+                value = gaia_info[col].values[0]
+                if col.endswith("_error") and value > 1:
+                    issues_dict[col] = value
+                    issues_text_list.append(f"Large error in {col}")
+                elif col.endswith("_flux") and value < -1:
+                    issues_dict[col] = value
+                    issues_text_list.append(f"Dim object in {col}")
+
+            if issues_dict:
+                # Order the labels: errors first, then fluxes.
+                error_labels = [l for l in issues_dict.keys() if l.endswith("_error")]
+                flux_labels = [l for l in issues_dict.keys() if l.endswith("_flux")]
+                ordered_labels = error_labels + flux_labels
+                ordered_values = [issues_dict[l] for l in ordered_labels]
+
+                ax2.bar(ordered_labels, ordered_values, color='skyblue', zorder=3)
+                ax2.tick_params("x", labelrotation=45)
+                ax2.set_title("Gaia Parameters with Issues")
+                ax2.set_ylabel("Standard Deviations from Mean")
+
+                # Add a vertical dashed line between error and flux groups.
+                add_vertical_line_between_groups(ax2, ordered_labels)
+            else:
+                ax2.text(0.5, 0.5, "No significant data issues", ha='center', va='center', fontsize=12)
+                ax2.axis("off")
+
+            # --- Subplot 3: Color–Magnitude Diagram (CMD) ---
+            # Compute additional columns for CMD.
+            df_sample['color'] = df_sample['phot_bp_mean_mag'] - df_sample['phot_rp_mean_mag']
+            df_sample['distance_pc'] = 1000 / df_sample['parallax']
+            df_sample['abs_mag'] = df_sample['phot_g_mean_mag'] - 5 * np.log10(df_sample['distance_pc'] / 10)
+            df_sample['is_correct'] = df_sample['source_id'].isin(correct_df['source_id'])
+            df_sample['is_incorrect'] = df_sample['source_id'].isin(incorrect_df['source_id'])
+
+            # Plot background stars (those not flagged as correct or incorrect)
+            mask_background = ~(df_sample['is_correct'] | df_sample['is_incorrect'])
+            ax3.scatter(df_sample.loc[mask_background, 'color'], 
+                        df_sample.loc[mask_background, 'abs_mag'],
+                        s=3, color='gray', alpha=0.6, label='Nearby Stars')
+
+            # Plot the incorrect in red.
+            ax3.scatter(df_sample[df_sample['is_incorrect']]['color'],
+                        df_sample[df_sample['is_incorrect']]['abs_mag'],
+                        s=100, color='red', label='Incorrectly Classified', alpha=1, 
+                        edgecolor='black', marker='H')
+            
+            # Plot the correct in green.
+            ax3.scatter(df_sample[df_sample['is_correct']]['color'],
+                        df_sample[df_sample['is_correct']]['abs_mag'],
+                        s=100, color='green', label='Correctly Classified', alpha=1, 
+                        edgecolor='black', marker='x')
+            
+            # Plot the target source in blue. FLUX IS NOT THE SAME AS MAGNITUDE, data for both exist in the Gaia table.
+            target_color = df_sample.loc[df_sample['source_id'] == source_id, 'color'].values[0]
+            target_abs_mag = df_sample.loc[df_sample['source_id'] == source_id, 'abs_mag'].values[0]
+            ax3.scatter(target_color, target_abs_mag, s=200, color='blue', label='Target Source', alpha=1, edgecolor='black', marker='o')
+            #target_abs_mag = match['phot_g_mean_flux'].values[0] - 5 * np.log10((1/match['parallax'].values[0] )/ 10)
+            #ax3.scatter(target_color, target_abs_mag, s=200, color='blue', label='Target Source', alpha=1, edgecolor='black', marker='o')
+
+
+            # In a CMD, brighter (lower) magnitudes are at the top.
+            ax3.invert_yaxis()
+            ax3.set_xlim(-0.5, 3.5)
+            ax3.set_ylim(14, 0.5)
+            ax3.set_xlabel('Colour (BP - RP)')
+            ax3.set_ylabel('Absolute G Magnitude')
+            ax3.set_title('Color–Magnitude Diagram (CMD)')
+            ax3.legend(loc='lower right')
+
+            plt.tight_layout()
+            if save_path:
+                save_path= save_path.replace(".png", f"_{n}.png")
+                plt.savefig(save_path)
+            plt.show()
+                
+        except Exception as e:
+            print(f"Error processing FITS data for source_id {source_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        finally:
+            # Ensure proper cleanup of FITS file
+            if hdul is not None:
+                try:
+                    hdul.close()
+                except Exception as e:
+                    print(f"Warning: Could not close FITS file: {e}")
+                    
+    except Exception as e:
+        print(f"Error in overall processing for source_id {source_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Example type conversions (ensure these columns are in the correct type)
+gaia_lamost_merged['obsid'] = gaia_lamost_merged['obsid'].astype(int)
+gaia_lamost_merged['source_id'] = gaia_lamost_merged['source_id'].astype(int)
+
+# Initialize a counter for the save path
+n_=1
+
+# Loop through incorrectly classified sources and plot all spectra with labels if Gaia data is problematic.
+for source_id in fn_prime_gaia_ids.astype(int):
+    plot_spectrum_with_gaia_and_cmd(source_id, gaia_lamost_merged, save_path=f"Images_and_Plots/CMD_Spectra_Gaia_CV.png", df_sample=df_sample, correct_df=correct_df, incorrect_df=incorrect_df, n=n_)
+    n_+=1
