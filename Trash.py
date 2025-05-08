@@ -9698,3 +9698,43 @@ n_=1
 for source_id in fn_prime_gaia_ids.astype(int):
     plot_spectrum_with_gaia_and_cmd(source_id, gaia_lamost_merged, save_path=f"Images_and_Plots/CMD_Spectra_Gaia_CV.png", df_sample=df_sample, correct_df=correct_df, incorrect_df=incorrect_df, n=n_)
     n_+=1
+
+# Define the ADQL query to fetch detailed information for the Correctly Classified Gaia IDs
+query = """
+SELECT source_id, ra, dec, parallax, phot_bp_mean_mag, phot_rp_mean_mag, phot_g_mean_mag, parallax_error
+FROM gaiadr3.gaia_source
+WHERE source_id IN ({})
+"""
+
+# Join the source IDs into a single string
+source_ids_str = ",".join([str(id) for id in correct_gaia_ids])
+full_query = query.format(source_ids_str)
+
+# Run the query asynchronously
+job = Gaia.launch_job_async(full_query)
+results = job.get_results()
+
+# Convert to Pandas DataFrame
+correct_df = results.to_pandas()
+
+print(f"✅ Retrieved detailed information for {len(correct_df)} correctly classified Gaia IDs.")
+
+# Define the ADQL query to fetch detailed information for the incorrectly Classified Gaia IDs
+query = """
+SELECT source_id, ra, dec, parallax, phot_bp_mean_mag, phot_rp_mean_mag, phot_g_mean_mag, parallax_error
+FROM gaiadr3.gaia_source
+WHERE source_id IN ({})
+"""
+
+# Join the source IDs into a single string
+source_ids_str = ",".join([str(id) for id in incorrect_gaia_ids])
+full_query = query.format(source_ids_str)
+
+# Run the query asynchronously
+job = Gaia.launch_job_async(full_query)
+results = job.get_results()
+
+# Convert to Pandas DataFrame
+incorrect_df = results.to_pandas()
+
+print(f"✅ Retrieved detailed information for {len(incorrect_df)} incorrectly classified Gaia IDs.")
