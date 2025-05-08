@@ -9738,3 +9738,227 @@ results = job.get_results()
 incorrect_df = results.to_pandas()
 
 print(f"✅ Retrieved detailed information for {len(incorrect_df)} incorrectly classified Gaia IDs.")
+
+
+# (Re-using and adapting code from the previous response)
+# Make sure to have the 'table9.dat' file for rejected IDs.
+
+def process_rejected_ids_file(filepath):
+    """Reads a file containing GaiaDR3 source IDs (one per line after header)
+    and returns a comma-separated string of these IDs."""
+    rejected_ids_list = []
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('#') or line.startswith('---') or not line:
+                    continue
+                rejected_ids_list.append(line)
+    except FileNotFoundError:
+        print(f"Error: File not found at {filepath} for rejected IDs.")
+        return None
+    return ",".join(rejected_ids_list)
+
+def get_missing_rr_lyrae_ids_string():
+    """Returns a comma-separated string of the 14 known missing RR Lyrae source_ids."""
+    missing_ids_list = [
+        '4092009204924599040', '4120414435009794048', '4144246349481643392',
+        '5797652730842515968', '5797917193442176640', '5846086424210395520',
+        '5917239841741208576', '5991733644318583424', '6017924835910361344',
+        '6069336998880602240', '6707009423228603904', '5935214760885709440',
+        '4362766825101261952', '5967334102579505664'
+    ]
+    return ",".join(missing_ids_list)
+
+def get_best_rr_lyrae_ids(rejected_ids_filepath="table9.dat", 
+                           use_astroquery=True, 
+                           login_credentials=None, 
+                           max_retries=3,
+                           retry_delay=10):
+    """
+    Fetches the source_ids for the best RR Lyrae dataset from Gaia DR3
+    as defined by Clementini et al. (2022).
+
+    Args:
+        rejected_ids_filepath (str): Path to the file containing rejected IDs.
+        use_astroquery (bool): If True, attempts to run the query using astroquery.
+                               If False, prints the query.
+        login_credentials (dict, optional): Gaia login credentials for astroquery.
+        max_retries (int): Number of retries for the Gaia query.
+        retry_delay (int): Delay in seconds between retries.
+
+
+    Returns:
+        list: A list of Gaia source_ids (as integers), or None if fetching fails.
+    """
+    print("Fetching best RR Lyrae source_ids...")
+    rejected_ids_string = process_rejected_ids_file(rejected_ids_filepath)
+    missing_ids_string = get_missing_rr_lyrae_ids_string()
+
+    if rejected_ids_string is None:
+        print("Cannot proceed without the list of rejected IDs.")
+        return None
+
+    adql_query = f"""
+    SELECT source_id FROM (
+        SELECT source_id
+        FROM gaiadr3.vari_rrlyrae
+        WHERE source_id NOT IN ({rejected_ids_string})
+        UNION
+        SELECT source_id
+        FROM gaiadr3.vari_classifier_result
+        WHERE source_id IN ({missing_ids_string})
+        -- Optional: Add more specific conditions for the 14 if needed
+        -- AND classlabel_best = 'RRLYR'
+        -- AND (best_classifier_name LIKE '%SOS_CEP_RRL_RRAB%' OR best_classifier_name LIKE '%SOS_CEP_RRL_RRC%' OR best_classifier_name LIKE '%SOS_CEP_RRL_RRD%')
+    ) AS combined_rrlyrae_ids
+    """
+
+    if not use_astroquery:
+        print("\nGenerated ADQL Query for Best RR Lyrae IDs:")
+        print(adql_query)
+        print("\nCopy the above query and run it on the Gaia Archive website.")
+        
+        return None # Or raise an exception if you expect IDs
+
+    print("Attempting to execute query with astroquery.gaia...")
+    for attempt in range(max_retries):
+        try:
+            if login_credentials:
+                Gaia.login(user=login_credentials['user'], password=login_credentials['password'])
+            else:
+                Gaia.login_anonymous()
+
+            job = Gaia.launch_job_async(adql_query)
+            results_table = job.get_results()
+            
+            if results_table and 'source_id' in results_table.colnames:
+                # Convert to list of integers
+                rr_lyrae_ids = results_table['source_id'].tolist()
+                print(f"✅ Successfully fetched {len(rr_lyrae_ids)} RR Lyrae source_ids.")
+                return rr_lyrae_ids
+            else:
+                print("Warning: Query executed but no 'source_id' column or no results found.")
+                return [] # Return empty list if no IDs
+
+        except Exception as e:
+            print(f"  Attempt {attempt + 1}/{max_retries} failed: {type(e).__name__} - {e}")
+            if attempt < max_retries - 1:
+                print(f"  Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print(f"  Max retries reached. Failed to fetch RR Lyrae IDs.")
+                return None
+    return None # Should not be reached if max_retries > 0
+
+# ... (all your existing imports and function definitions) ...
+
+# <<< ADD THE HELPER FUNCTIONS FROM ABOVE HERE (process_rejected_ids_file, get_missing_rr_lyrae_ids_string, get_best_rr_lyrae_ids) >>>
+
+# --- Main execution block (modified) ---
+if __name__ == "__main__":
+    # --- Configuration for your pipeline ---
+    lamost_catalogue_path = "lamost/minimal.csv"  # Load LAMOST catalog
+    model_path = "Models/model_fusion_mambaoutv3.pth"
+    gaia_transformer_path = "Pickles/gaia_normalization.pkl"
+    rejected_rr_lyrae_ids_file = "Pickles/Table9_RR*.txt"  # Path to the file with rejected IDs
+
+    # --- Step 0: Fetch the best RR Lyrae Gaia IDs ---
+    print("\n🌟 Step 0: Fetching the list of best RR Lyrae Gaia DR3 IDs...")
+    
+    # Option 1: Use astroquery (recommended for automation)
+    # You might need to provide Gaia login credentials if anonymous access is insufficient
+    # gaia_login_creds = {'user': 'your_username', 'password': 'your_password'}
+    gaia_login_creds = None 
+    all_rr_lyrae_gaia_ids = get_best_rr_lyrae_ids(
+        rejected_ids_filepath=rejected_rr_lyrae_ids_file,
+        use_astroquery=False
+    )
+
+    # Option 2: If you want to manually run the ADQL (set use_astroquery=False)
+    # get_best_rr_lyrae_ids(rejected_ids_filepath=rejected_rr_lyrae_ids_file, use_astroquery=False)
+    # print("After running the query manually, load the IDs, e.g., from a CSV:")
+    # loaded_rr_lyrae_df = pd.read_csv("path_to_your_downloaded_rr_lyrae_ids.csv")
+    # all_rr_lyrae_gaia_ids = loaded_rr_lyrae_df['source_id'].tolist()
+
+
+    if all_rr_lyrae_gaia_ids is None or not all_rr_lyrae_gaia_ids:
+        print("⚠️ Could not obtain RR Lyrae Gaia IDs. Exiting pipeline.")
+    else:
+        print(f"Retrieved {len(all_rr_lyrae_gaia_ids)} RR Lyrae source_ids for processing.")
+        
+        # For testing, you might want to use a smaller subset
+        # rr_lyrae_ids_to_process = all_rr_lyrae_gaia_ids[:1000] 
+        rr_lyrae_ids_to_process = all_rr_lyrae_gaia_ids # Process all
+
+        print(f"Selected {len(rr_lyrae_ids_to_process)} RR Lyrae IDs for the pipeline.")
+
+        # --- Load LAMOST catalog ---
+        try:
+            lamost_catalogue = pd.read_csv(lamost_catalogue_path)
+        except FileNotFoundError:
+            print(f"Error: LAMOST catalogue not found at {lamost_catalogue_path}. Exiting.")
+            exit()
+        
+        # --- Run your prediction pipeline ---
+        df_predictions_rrlyrae, gaia_lamost_merged_rrlyrae = predict_star_labels(
+            gaia_ids=rr_lyrae_ids_to_process,
+            model_path=model_path,
+            lamost_catalogue=lamost_catalogue, # Pass the loaded DataFrame
+            gaia_transformer_path=gaia_transformer_path
+        )
+
+        if df_predictions_rrlyrae is not None and not df_predictions_rrlyrae.empty:
+            print("\n✅ RR Lyrae Prediction Pipeline Completed.")
+            # Save the predictions
+            df_predictions_rrlyrae.to_csv("rr_lyrae_predictions.csv", index=False)
+            print("RR Lyrae predictions saved to rr_lyrae_predictions.csv")
+            if gaia_lamost_merged_rrlyrae is not None and not gaia_lamost_merged_rrlyrae.empty:
+                 gaia_lamost_merged_rrlyrae.to_csv("rr_lyrae_gaia_lamost_merged.csv", index=False)
+                 print("RR Lyrae merged data saved to rr_lyrae_gaia_lamost_merged.csv")
+
+            # --- Example: Plotting or further analysis for RR Lyrae ---
+            # You can now use df_predictions_rrlyrae and gaia_lamost_merged_rrlyrae
+            # for your plotting and analysis specific to RR Lyrae stars.
+
+            # For instance, if you want to see how many were predicted as "RRLyr*":
+            if "RRLyr*" in df_predictions_rrlyrae.columns:
+                predicted_as_rrlyr_count = df_predictions_rrlyrae["RRLyr*"].sum()
+                print(f"Number of stars predicted as 'RRLyr*': {predicted_as_rrlyr_count} out of {len(df_predictions_rrlyrae)}")
+
+            # Example plotting call (you'll need to adapt it for RR Lyrae truth if available)
+            # For now, let's just plot the first few if they exist
+            # This part needs careful thought on what 'correct_df' and 'incorrect_df' mean for RR Lyrae
+            # since you are *predicting* them.
+            # For demonstration, let's just pick some from the merged data for plotting.
+            
+            # if gaia_lamost_merged_rrlyrae is not None and not gaia_lamost_merged_rrlyrae.empty:
+            #     sample_ids_for_plotting = gaia_lamost_merged_rrlyrae['source_id'].unique()[:min(5, len(gaia_lamost_merged_rrlyrae['source_id'].unique()))]
+            #     
+            #     # Create dummy correct/incorrect DFs for plotting function if not otherwise defined for RR Lyrae
+            #     # In a real scenario, you'd compare predictions to the known RR Lyrae status.
+            #     # For now, this is just to make the plot function runnable.
+            #     dummy_correct_df = pd.DataFrame({'source_id': []}) 
+            #     dummy_incorrect_df = pd.DataFrame({'source_id': sample_ids_for_plotting}) 
+            #
+            #     print(f"\nPlotting for a few RR Lyrae samples...")
+            #     for n_idx, sid in enumerate(sample_ids_for_plotting):
+            #         print(f"Plotting for source_id: {sid}")
+            #         # You'd need a df_sample_rrlyrae equivalent for the CMD background
+            #         # For now, using the EB one as a placeholder - THIS NEEDS REFINEMENT
+            #         df_sample_cmd_background = pd.read_csv("gaia_sample_combined_detailed.csv") # Placeholder
+            #
+            #         plot_spectrum_with_gaia_and_cmd(
+            #             source_id=sid,
+            #             gaia_lamost_merged=gaia_lamost_merged_rrlyrae,
+            #             df_sample=df_sample_cmd_background, # Placeholder background
+            #             correct_df=dummy_correct_df,     # Placeholder
+            #             incorrect_df=dummy_incorrect_df, # Placeholder
+            #             n=n_idx,
+            #             spectra_folder="lamost_spectra_uniques",
+            #             save_path="Images_and_Plots/CMD_Spectra_Gaia_RRLyrae.png"
+            #         )
+        else:
+            print("⚠️ RR Lyrae Prediction Pipeline did not produce results.")
+
+# ... (your existing code for Eclipsing Binaries can remain below or be separated)
