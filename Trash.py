@@ -9962,3 +9962,849 @@ if __name__ == "__main__":
             print("⚠️ RR Lyrae Prediction Pipeline did not produce results.")
 
 # ... (your existing code for Eclipsing Binaries can remain below or be separated)
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from astroquery.gaia import Gaia # For querying Gaia archive
+
+# --- 0. Configuration ---
+GAIA_TABLE_NAME = "gaiadr3.gaia_source" # Gaia Data Release 3
+# GAIA_TABLE_NAME = "gaiaedr3.gaia_source" # Gaia Early Data Release 3 (if preferred)
+SAVE_FIGURE = True
+FIGURE_FILENAME = "cmd_model_rr_stars_queried.png"
+# Gaia TAP has limits on the number of IDs in an IN clause.
+# Typically around 50,000 but can vary. We'll batch if needed.
+MAX_SOURCE_IDS_PER_QUERY = 40000
+
+# --- 1. Load Model Predictions and Class Information ---
+try:
+    y_pred_full = np.load("y_predictions_ecl.npy")
+except FileNotFoundError:
+    print("Error: 'y_predictions_ecl.npy' not found. Please check the path.")
+    exit()
+
+try:
+    classes = pd.read_pickle("Pickles/Updated_List_of_Classes_ubuntu.pkl")
+    if not isinstance(classes, list):
+        classes = list(classes)
+except FileNotFoundError:
+    print("Error: 'Pickles/Updated_List_of_Classes_ubuntu.pkl' not found. Please check the path.")
+    exit()
+
+print("Classes loaded:", classes)
+
+# Separate predictions from source_ids
+y_pred_model = np.array(y_pred_full[:, :-1], dtype=int)
+# Get all source_ids from your predictions file; these are the stars we need Gaia data for.
+try:
+    all_source_ids_from_model = y_pred_full[:, -1].astype(np.int64)
+except ValueError:
+    print("Warning: Could not convert all source_ids to int64. Attempting to clean...")
+    all_source_ids_from_model = pd.to_numeric(y_pred_full[:, -1], errors='coerce')
+    all_source_ids_from_model = all_source_ids_from_model[~np.isnan(all_source_ids_from_model)].astype(np.int64)
+
+unique_source_ids_to_query = pd.unique(all_source_ids_from_model)
+print(f"Found {len(all_source_ids_from_model)} total predictions, corresponding to {len(unique_source_ids_to_query)} unique source_ids to query from Gaia.")
+
+if len(unique_source_ids_to_query) == 0:
+    print("No source_ids found in predictions file. Exiting.")
+    exit()
+
+# --- 2. Identify RR* Stars from Model Predictions (using their source_ids) ---
+try:
+    rr_star_class_index = classes.index("RR*")
+    print(f"Index for 'RR*' class: {rr_star_class_index}")
+except ValueError:
+    print("Error: 'RR*' class not found in the loaded classes list.")
+    print("Available classes are:", classes)
+    exit()
+
+# Get the column for RR* predictions
+rr_star_predictions_column = y_pred_model[:, rr_star_class_index]
+# Create a boolean mask for stars predicted as RR*
+model_predicted_rr_star_mask = (rr_star_predictions_column == 1)
+# Get the source_ids of these predicted RR* stars
+predicted_rr_star_source_ids = all_source_ids_from_model[model_predicted_rr_star_mask]
+predicted_rr_star_source_ids_unique = pd.unique(predicted_rr_star_source_ids) # Ensure unique
+
+print(f"Found {len(predicted_rr_star_source_ids_unique)} unique sources classified as 'RR*' by the model.")
+if len(predicted_rr_star_source_ids_unique) == 0:
+    print("No 'RR*' stars were classified by the model by source_id.")
+
+# --- 3. Query Gaia Archive for Photometric Data ---
+print("\n--- Querying Gaia Archive ---")
+
+def query_gaia_for_sources_batched(source_ids_list_np_array):
+    """
+    Queries Gaia archive for a list of source_ids in batches.
+    Returns a Pandas DataFrame.
+    """
+    if not source_ids_list_np_array.size:
+        print("No source_ids provided for Gaia query.")
+        return pd.DataFrame()
+
+    all_gaia_data_dfs = []
+    num_total_ids = len(source_ids_list_np_array)
+    num_batches = (num_total_ids + MAX_SOURCE_IDS_PER_QUERY - 1) // MAX_SOURCE_IDS_PER_QUERY
+
+    for i in range(num_batches):
+        start_idx = i * MAX_SOURCE_IDS_PER_QUERY
+        end_idx = min((i + 1) * MAX_SOURCE_IDS_PER_QUERY, num_total_ids)
+        batch_ids_np = source_ids_list_np_array[start_idx:end_idx]
+        
+        # Convert numpy array of IDs to a comma-separated string for the ADQL query
+        id_list_str = ",".join(batch_ids_np.astype(str))
+        
+        query = f"""
+        SELECT source_id, ra, dec, parallax, parallax_error,
+               phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
+               ruwe -- Renormalised Unit Weight Error, good quality indicator
+        FROM {GAIA_TABLE_NAME}
+        WHERE source_id IN ({id_list_str})
+        """
+        print(f"Executing Gaia query for batch {i+1}/{num_batches} (Sources {start_idx+1} to {end_idx} of {num_total_ids})...")
+        try:
+            # Using synchronous job for simplicity here, can be changed to async for very large datasets
+            job = Gaia.launch_job(query) # Synchronous
+            # For asynchronous:
+            # job = Gaia.launch_job_async(query)
+            results_table = job.get_results()
+            if len(results_table) > 0:
+                gaia_df_batch = results_table.to_pandas()
+                all_gaia_data_dfs.append(gaia_df_batch)
+                print(f"Batch {i+1} query successful, retrieved {len(gaia_df_batch)} rows from Gaia.")
+            else:
+                print(f"Batch {i+1} query returned no results from Gaia for the given IDs.")
+        except Exception as e:
+            print(f"Error querying Gaia for batch {i+1}: {e}")
+            # Optionally, add retry logic or decide how to handle partial failures
+    
+    if not all_gaia_data_dfs:
+        print("Gaia query yielded no results across all batches or all batches failed.")
+        return pd.DataFrame()
+        
+    df_gaia_queried = pd.concat(all_gaia_data_dfs, ignore_index=True)
+    
+    if 'source_id' in df_gaia_queried.columns:
+        df_gaia_queried['source_id'] = df_gaia_queried['source_id'].astype(np.int64)
+    else:
+        print("Critical Error: 'source_id' column not found in Gaia query result. Cannot proceed.")
+        return pd.DataFrame() # Return empty DF
+
+    print(f"Total Gaia data queried. Shape: {df_gaia_queried.shape}")
+    return df_gaia_queried
+
+# Query Gaia for all unique source_ids identified from your y_pred file
+df_gaia_cmd_data = query_gaia_for_sources_batched(unique_source_ids_to_query)
+
+if df_gaia_cmd_data.empty:
+    print("Error: Failed to retrieve necessary data from Gaia. Cannot proceed with CMD.")
+    exit()
+
+# Essential columns for CMD (check if they exist after query)
+required_gaia_cols = ['source_id', 'phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag', 'parallax']
+missing_cols = [col for col in required_gaia_cols if col not in df_gaia_cmd_data.columns]
+if missing_cols:
+    print(f"Error: The following required columns are missing from the Gaia query result: {missing_cols}")
+    print(f"Available columns in queried data: {df_gaia_cmd_data.columns.tolist()}")
+    exit()
+
+# --- 4. Calculate CMD Parameters (Color and Absolute Magnitude) ---
+print("\n--- Calculating CMD Parameters ---")
+df_cmd = df_gaia_cmd_data.copy() # Use the freshly queried data
+
+# Drop rows with NaN in essential photometric/parallax columns for CMD
+df_cmd.dropna(subset=required_gaia_cols, inplace=True)
+print(f"Shape after dropping NaNs in essential CMD columns: {df_cmd.shape}")
+
+# Filter for valid parallax values (must be positive for distance calculation)
+df_cmd = df_cmd[df_cmd['parallax'] > 0]
+# Optional: Add a more stringent parallax quality cut, e.g., parallax_over_error
+# if 'parallax_error' in df_cmd.columns and df_cmd['parallax_error'] is not None:
+#     df_cmd = df_cmd[df_cmd['parallax'] / df_cmd['parallax_error'] > 5] # Example cut
+#if 'ruwe' in df_cmd.columns: # RUWE < 1.4 is often a good quality indicator
+#    df_cmd = df_cmd[df_cmd['ruwe'] < 1.4]
+
+
+print(f"Shape after filtering for positive parallax (and any other quality cuts): {df_cmd.shape}")
+
+if df_cmd.empty:
+    print("Error: No valid Gaia data remains after filtering for CMD plotting. Cannot generate CMD.")
+    exit()
+
+# Calculate color (G_BP - G_RP)
+df_cmd['color'] = df_cmd['phot_bp_mean_mag'] - df_cmd['phot_rp_mean_mag']
+
+# Calculate distance in parsecs (parallax is typically in milliarcseconds (mas))
+df_cmd['distance_pc'] = 1000.0 / df_cmd['parallax']
+
+# Calculate absolute G magnitude (M_G)
+# M = m - 5 * (log10(d_pc) - 1)
+df_cmd['abs_mag_g'] = df_cmd['phot_g_mean_mag'] - 5 * (np.log10(df_cmd['distance_pc']) - 1)
+
+# Flag which stars in the CMD data were predicted as RR* by your model
+# Use the unique list of RR* source IDs derived earlier
+df_cmd['is_model_rr_star'] = df_cmd['source_id'].isin(predicted_rr_star_source_ids_unique)
+
+# --- 5. Create and Display the CMD Plot ---
+print("\n--- Generating CMD Plot ---")
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.figure(figsize=(12, 10))
+
+# Plot all stars from df_cmd (which now contains all queried sources with valid CMD data)
+# as background, unless they are model-classified RR*
+background_stars_mask = ~df_cmd['is_model_rr_star']
+plt.scatter(df_cmd.loc[background_stars_mask, 'color'],
+            df_cmd.loc[background_stars_mask, 'abs_mag_g'],
+            s=5,  # Small size for background stars
+            color='grey',
+            alpha=0.4, # Low alpha for density effect
+            label='Background Stars (from model input)',
+            zorder=1) # Plot background first
+
+# Plot the RR* stars classified by the model that are present in the CMD data
+model_rr_stars_in_cmd = df_cmd[df_cmd['is_model_rr_star']]
+if not model_rr_stars_in_cmd.empty:
+    plt.scatter(model_rr_stars_in_cmd['color'],
+                model_rr_stars_in_cmd['abs_mag_g'],
+                s=70, # Larger size for highlighted stars
+                color='red',
+                edgecolor='black',
+                marker='*', # Star marker
+                label=f'Model Classified RR* ({len(model_rr_stars_in_cmd)})',
+                zorder=2) # Plot on top
+    print(f"Plotting {len(model_rr_stars_in_cmd)} model-classified RR* stars found with valid CMD data.")
+else:
+    print("No model-classified RR* stars have valid CMD data to plot, or none were found in the Gaia query results for RR* IDs.")
+
+# Set plot labels and title
+plt.xlabel('Color ($G_{BP} - G_{RP}$)', fontsize=14)
+plt.ylabel('Absolute G Magnitude ($M_G$)', fontsize=14)
+plt.title('Color-Magnitude Diagram (Gaia Data Queried from Model Input)', fontsize=16)
+
+# Invert the y-axis (brighter stars at the top, smaller magnitude values)
+plt.gca().invert_yaxis()
+
+# Optional: Set plot limits (adjust as needed for your data's actual range)
+# You might want to calculate these dynamically based on the quantiles of your data
+# Example:
+# color_min, color_max = df_cmd['color'].quantile(0.01), df_cmd['color'].quantile(0.99)
+# abs_mag_min, abs_mag_max = df_cmd['abs_mag_g'].quantile(0.01), df_cmd['abs_mag_g'].quantile(0.99)
+# plt.xlim(max(-1.0, color_min - 0.5), min(4.0, color_max + 0.5))
+# plt.ylim(min(18, abs_mag_max + 2), max(-7, abs_mag_min - 2)) # Remember y-axis is inverted
+
+# Add a legend
+plt.legend(fontsize=12, loc='upper right') # 'best' or a specific location
+
+# Add grid for better readability
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.xticks(fontsize=12)
+plt.yticks(fontsize=12)
+
+plt.tight_layout() # Adjust layout to prevent labels from overlapping
+
+if SAVE_FIGURE:
+    plt.savefig(FIGURE_FILENAME, dpi=300)
+    print(f"CMD plot saved as {FIGURE_FILENAME}")
+
+plt.show()
+
+print("\nScript finished.")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from astroquery.gaia import Gaia
+
+# --- 0. Configuration ---
+GAIA_TABLE_NAME = "gaiadr3.gaia_source"
+SAVE_FIGURE = True
+FIGURE_FILENAME = "cmd_model_rr_stars_with_dense_background.png"
+MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH = 40000 # For querying your model's specific IDs
+
+# Configuration for the DENSE BACKGROUND query
+BACKGROUND_QUERY_LIMIT = 200000  # How many background stars to fetch (adjust as needed)
+BACKGROUND_PARALLAX_MIN = 1.0   # mas, e.g., > 1 mas means within 1 kpc
+BACKGROUND_G_MAG_MAX = 19.0     # Apparent G magnitude limit for background
+BACKGROUND_RUWE_MAX = 1.4       # Quality cut for background stars
+
+# --- 1. Load Model Predictions and Class Information ---
+try:
+    y_pred_full = np.load("y_predictions_ecl.npy")
+except FileNotFoundError:
+    print("Error: 'y_predictions_ecl.npy' not found. Please check the path.")
+    exit()
+
+try:
+    classes = pd.read_pickle("Pickles/Updated_List_of_Classes_ubuntu.pkl")
+    if not isinstance(classes, list):
+        classes = list(classes)
+except FileNotFoundError:
+    print("Error: 'Pickles/Updated_List_of_Classes_ubuntu.pkl' not found. Please check the path.")
+    exit()
+print("Classes loaded.")
+
+# Source IDs from your model's input file
+y_pred_model_classes = np.array(y_pred_full[:, :-1], dtype=int)
+all_source_ids_from_model_input = y_pred_full[:, -1]
+try:
+    unique_source_ids_for_model_query = pd.unique(all_source_ids_from_model_input.astype(np.int64))
+except ValueError:
+    temp_ids = pd.to_numeric(all_source_ids_from_model_input, errors='coerce')
+    unique_source_ids_for_model_query = pd.unique(temp_ids[~np.isnan(temp_ids)].astype(np.int64))
+
+print(f"Found {len(unique_source_ids_for_model_query)} unique source_ids from model input file.")
+
+# --- 2. Identify RR* Stars from Model Predictions ---
+try:
+    rr_star_class_index = classes.index("RR*")
+except ValueError:
+    print("Error: 'RR*' class not found. Available:", classes)
+    exit()
+
+rr_star_predictions_column = y_pred_model_classes[:, rr_star_class_index]
+model_predicted_rr_star_mask = (rr_star_predictions_column == 1)
+predicted_rr_star_source_ids = all_source_ids_from_model_input[model_predicted_rr_star_mask]
+try:
+    predicted_rr_star_source_ids_unique = pd.unique(predicted_rr_star_source_ids.astype(np.int64))
+except ValueError:
+    temp_ids_rr = pd.to_numeric(predicted_rr_star_source_ids, errors='coerce')
+    predicted_rr_star_source_ids_unique = pd.unique(temp_ids_rr[~np.isnan(temp_ids_rr)].astype(np.int64))
+print(f"Identified {len(predicted_rr_star_source_ids_unique)} unique source_ids classified as 'RR*' by the model.")
+
+
+# --- 3. Gaia Query Functions ---
+def query_gaia_for_specific_ids_batched(source_ids_list_np_array):
+    """Queries Gaia for a specific list of source_ids in batches."""
+    if not source_ids_list_np_array.size: return pd.DataFrame()
+    all_gaia_data_dfs = []
+    num_total_ids = len(source_ids_list_np_array)
+    num_batches = (num_total_ids + MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH - 1) // MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH
+
+    for i in range(num_batches):
+        start_idx = i * MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH
+        end_idx = min((i + 1) * MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH, num_total_ids)
+        batch_ids_np = source_ids_list_np_array[start_idx:end_idx]
+        id_list_str = ",".join(batch_ids_np.astype(str))
+        
+        query = f"""
+        SELECT source_id, parallax, parallax_error,
+               phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag
+        FROM {GAIA_TABLE_NAME}
+        WHERE source_id IN ({id_list_str})
+        """
+        print(f"Querying Gaia for model stars batch {i+1}/{num_batches}...")
+        try:
+            job = Gaia.launch_job(query)
+            results_table = job.get_results()
+            if len(results_table) > 0:
+                all_gaia_data_dfs.append(results_table.to_pandas())
+        except Exception as e:
+            print(f"Error querying Gaia for model stars batch {i+1}: {e}")
+    
+    if not all_gaia_data_dfs: return pd.DataFrame()
+    df_gaia_queried = pd.concat(all_gaia_data_dfs, ignore_index=True)
+    if 'source_id' in df_gaia_queried.columns:
+        df_gaia_queried['source_id'] = df_gaia_queried['source_id'].astype(np.int64)
+    return df_gaia_queried
+
+def query_gaia_for_background_stars():
+    """Queries Gaia for a general sample of background stars."""
+    query = f"""
+    SELECT TOP {BACKGROUND_QUERY_LIMIT}
+           source_id, parallax, parallax_error,
+           phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, ruwe
+    FROM {GAIA_TABLE_NAME}
+    WHERE parallax >= {BACKGROUND_PARALLAX_MIN}
+      AND phot_g_mean_mag <= {BACKGROUND_G_MAG_MAX}
+      AND ruwe < {BACKGROUND_RUWE_MAX}
+      AND phot_bp_mean_mag IS NOT NULL
+      AND phot_rp_mean_mag IS NOT NULL
+      AND phot_g_mean_mag IS NOT NULL
+      AND parallax IS NOT NULL 
+    ORDER BY random_index -- Ensures a somewhat random sample if TOP is used with many results
+    """
+    # For some Gaia archives (like DR2, or if random_index isn't available/performant),
+    # you might remove "ORDER BY random_index" or use a different strategy.
+    # For DR3, random_index is good.
+
+    print(f"\nQuerying Gaia for {BACKGROUND_QUERY_LIMIT} background stars...")
+    try:
+        job = Gaia.launch_job(query)
+        results_table = job.get_results()
+        if len(results_table) > 0:
+            df_background = results_table.to_pandas()
+            if 'source_id' in df_background.columns:
+                 df_background['source_id'] = df_background['source_id'].astype(np.int64)
+            print(f"Retrieved {len(df_background)} background stars from Gaia.")
+            return df_background
+        else:
+            print("Gaia query for background stars returned no results.")
+            return pd.DataFrame()
+    except Exception as e:
+        print(f"Error querying Gaia for background stars: {e}")
+        return pd.DataFrame()
+
+# --- 4. Fetch Data from Gaia ---
+# Data for stars in your model input file
+print("\n--- Fetching Gaia data for stars from your model input file ---")
+df_model_stars_gaia = query_gaia_for_specific_ids_batched(unique_source_ids_for_model_query)
+if df_model_stars_gaia.empty:
+    print("Warning: Failed to retrieve Gaia data for any stars from your model input file.")
+    # Depending on requirements, you might want to exit or continue with only background
+
+# Data for the general background
+print("\n--- Fetching Gaia data for dense CMD background ---")
+df_background_gaia = query_gaia_for_background_stars()
+if df_background_gaia.empty:
+    print("Warning: Failed to retrieve Gaia data for the background. CMD will be sparse.")
+
+# --- 5. Prepare DataFrames for CMD Plotting ---
+def prepare_for_cmd(df, is_rr_star_col=False, rr_star_ids=None):
+    """Calculates color, absolute magnitude, and applies filters."""
+    if df.empty:
+        return pd.DataFrame()
+        
+    # Ensure required columns exist
+    required_cols = ['phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag', 'parallax']
+    if not all(col in df.columns for col in required_cols):
+        print(f"Warning: DataFrame is missing one or more required columns for CMD: {required_cols}")
+        return pd.DataFrame()
+
+    df_cmd = df.copy()
+    df_cmd.dropna(subset=required_cols, inplace=True)
+    df_cmd = df_cmd[df_cmd['parallax'] > 0] # Valid parallax for distance
+    #if 'ruwe' in df_cmd.columns: # Apply RUWE cut if column exists
+    #     df_cmd = df_cmd[df_cmd['ruwe'] < BACKGROUND_RUWE_MAX] # Use the same quality for consistency
+
+    if df_cmd.empty: return pd.DataFrame()
+
+    df_cmd['color'] = df_cmd['phot_bp_mean_mag'] - df_cmd['phot_rp_mean_mag']
+    df_cmd['distance_pc'] = 1000.0 / df_cmd['parallax']
+    df_cmd['abs_mag_g'] = df_cmd['phot_g_mean_mag'] - 5 * (np.log10(df_cmd['distance_pc']) - 1)
+    
+    if is_rr_star_col and rr_star_ids is not None and 'source_id' in df_cmd.columns:
+        df_cmd['is_model_rr_star'] = df_cmd['source_id'].isin(rr_star_ids)
+    
+    return df_cmd
+
+print("\n--- Preparing CMD data ---")
+df_cmd_model_stars = prepare_for_cmd(df_model_stars_gaia, is_rr_star_col=True, rr_star_ids=predicted_rr_star_source_ids_unique)
+df_cmd_background = prepare_for_cmd(df_background_gaia)
+
+# --- 6. Create and Display the CMD Plot ---
+print("\n--- Generating CMD Plot ---")
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.figure(figsize=(12, 10))
+
+# A. Plot the DENSE BACKGROUND stars first
+if not df_cmd_background.empty:
+    plt.scatter(df_cmd_background['color'],
+                df_cmd_background['abs_mag_g'],
+                s=1,  # Very small for dense background
+                color='silver', # Light grey or silver
+                alpha=0.3,
+                label=f'Nearby Stars (Gaia sample, N={len(df_cmd_background)})',
+                zorder=1)
+    print(f"Plotting {len(df_cmd_background)} background stars.")
+else:
+    print("No background stars to plot.")
+
+# B. Plot ALL stars from your model's input (that have valid CMD data)
+# These will appear over the general background. Some might be faint if not RR*.
+if not df_cmd_model_stars.empty:
+    # Filter out the ones that will be plotted as RR* to avoid double plotting the points
+    model_stars_not_rr = df_cmd_model_stars[~df_cmd_model_stars['is_model_rr_star']]
+    if not model_stars_not_rr.empty:
+        plt.scatter(model_stars_not_rr['color'],
+                    model_stars_not_rr['abs_mag_g'],
+                    s=10, # Slightly larger than background, smaller than highlighted RR*
+                    color='dimgray', # A darker grey to distinguish from background
+                    alpha=0.7,
+                    label=f'Other Model Input Stars (N={len(model_stars_not_rr)})',
+                    zorder=2)
+        print(f"Plotting {len(model_stars_not_rr)} other model input stars.")
+
+    # C. Highlight the RR* stars classified by your model
+    model_rr_stars_to_plot = df_cmd_model_stars[df_cmd_model_stars['is_model_rr_star']]
+    if not model_rr_stars_to_plot.empty:
+        plt.scatter(model_rr_stars_to_plot['color'],
+                    model_rr_stars_to_plot['abs_mag_g'],
+                    s=70,
+                    color='red',
+                    edgecolor='black',
+                    marker='*',
+                    label=f'Model Classified RR* (N={len(model_rr_stars_to_plot)})',
+                    zorder=3) # Highest zorder
+        print(f"Plotting {len(model_rr_stars_to_plot)} model-classified RR* stars.")
+    else:
+        print("No model-classified RR* stars with valid CMD data to plot.")
+elif df_cmd_model_stars.empty : # If model_stars_gaia was empty to begin with
+    print("No model input stars with valid CMD data to plot.")
+
+
+# Set plot labels and title
+plt.xlabel('Color ($G_{BP} - G_{RP}$)', fontsize=14)
+plt.ylabel('Absolute G Magnitude ($M_G$)', fontsize=14)
+plt.title('Color-Magnitude Diagram with Dense Background', fontsize=16)
+plt.gca().invert_yaxis()
+
+# Optional: Set plot limits (adjust based on typical CMDs or your data's range)
+# plt.xlim(-0.5, 3.0)  # Typical color range
+# plt.ylim(15, -5)    # Typical M_G range (inverted)
+
+# Dynamically set limits based on the plotted data, giving some padding
+all_colors = []
+all_abs_mags = []
+if not df_cmd_background.empty:
+    all_colors.extend(df_cmd_background['color'].tolist())
+    all_abs_mags.extend(df_cmd_background['abs_mag_g'].tolist())
+if not df_cmd_model_stars.empty:
+    all_colors.extend(df_cmd_model_stars['color'].tolist())
+    all_abs_mags.extend(df_cmd_model_stars['abs_mag_g'].tolist())
+
+if all_colors and all_abs_mags:
+    color_min, color_max = np.nanpercentile(all_colors, [1, 99])
+    abs_mag_min, abs_mag_max = np.nanpercentile(all_abs_mags, [1, 99]) # Min mag is brighter
+
+    plt.xlim(color_min - 0.2, color_max + 0.2)
+    plt.ylim(abs_mag_max + 1, abs_mag_min - 1) # Y-axis is inverted
+else: # Fallback if no data plotted
+    plt.xlim(-0.5, 3.0)
+    plt.ylim(18, -6)
+
+
+plt.legend(fontsize=10, loc='upper right')
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.xticks(fontsize=12)
+plt.yticks(fontsize=12)
+plt.tight_layout()
+
+if SAVE_FIGURE:
+    plt.savefig(FIGURE_FILENAME, dpi=300)
+    print(f"CMD plot saved as {FIGURE_FILENAME}")
+
+plt.show()
+print("\nScript finished.")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from astroquery.gaia import Gaia
+
+# --- 0. Configuration ---
+GAIA_TABLE_NAME = "gaiadr3.gaia_source"
+SAVE_FIGURE = True
+FIGURE_FILENAME = "cmd_model_rr_stars_with_dense_background_v2.png"
+MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH = 40000
+
+BACKGROUND_QUERY_LIMIT = 75000
+BACKGROUND_PARALLAX_MIN = 1.0
+BACKGROUND_G_MAG_MAX = 19.0
+BACKGROUND_RUWE_MAX = 1.4 # RUWE cut for general background
+
+# RUWE cut specifically for your RR* stars - can be made more lenient or disabled
+RR_STAR_RUWE_MAX = 2.0 # Example: Allow slightly higher RUWE for RR*
+# RR_STAR_RUWE_MAX = None # To disable RUWE cut for RR*
+
+# --- 1. Load Model Predictions and Class Information ---
+try:
+    y_pred_full = np.load("y_predictions_ecl.npy")
+except FileNotFoundError:
+    print("Error: 'y_predictions_ecl.npy' not found. Please check the path.")
+    exit()
+
+try:
+    classes = pd.read_pickle("Pickles/Updated_List_of_Classes_ubuntu.pkl")
+    if not isinstance(classes, list):
+        classes = list(classes)
+except FileNotFoundError:
+    print("Error: 'Pickles/Updated_List_of_Classes_ubuntu.pkl' not found. Please check the path.")
+    exit()
+print("Classes loaded.")
+
+y_pred_model_classes = np.array(y_pred_full[:, :-1], dtype=int)
+all_source_ids_from_model_input = y_pred_full[:, -1]
+try:
+    unique_source_ids_for_model_query = pd.unique(all_source_ids_from_model_input.astype(np.int64))
+except ValueError:
+    temp_ids = pd.to_numeric(all_source_ids_from_model_input, errors='coerce')
+    unique_source_ids_for_model_query = pd.unique(temp_ids[~np.isnan(temp_ids)].astype(np.int64))
+print(f"Found {len(unique_source_ids_for_model_query)} unique source_ids from model input file.")
+
+# --- 2. Identify RR* Stars from Model Predictions ---
+try:
+    rr_star_class_index = classes.index("RR*")
+except ValueError:
+    print("Error: 'RR*' class not found. Available:", classes); exit()
+
+rr_star_predictions_column = y_pred_model_classes[:, rr_star_class_index]
+model_predicted_rr_star_mask = (rr_star_predictions_column == 1)
+predicted_rr_star_source_ids_initial = all_source_ids_from_model_input[model_predicted_rr_star_mask]
+try:
+    # This is the set of IDs your model called RR* BEFORE any Gaia query or filtering
+    unique_predicted_rr_star_ids_model = pd.unique(predicted_rr_star_source_ids_initial.astype(np.int64))
+except ValueError:
+    temp_ids_rr = pd.to_numeric(predicted_rr_star_source_ids_initial, errors='coerce')
+    unique_predicted_rr_star_ids_model = pd.unique(temp_ids_rr[~np.isnan(temp_ids_rr)].astype(np.int64))
+print(f"Model identified {len(unique_predicted_rr_star_ids_model)} unique source_ids as 'RR*'.")
+
+# --- 3. Gaia Query Functions (same as before) ---
+def query_gaia_for_specific_ids_batched(source_ids_list_np_array):
+    if not source_ids_list_np_array.size: return pd.DataFrame()
+    all_gaia_data_dfs = []
+    num_total_ids = len(source_ids_list_np_array)
+    num_batches = (num_total_ids + MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH - 1) // MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH
+    for i in range(num_batches):
+        start_idx = i * MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH
+        end_idx = min((i + 1) * MAX_SOURCE_IDS_PER_MODEL_QUERY_BATCH, num_total_ids)
+        batch_ids_np = source_ids_list_np_array[start_idx:end_idx]
+        id_list_str = ",".join(batch_ids_np.astype(str))
+        query = f"""
+        SELECT source_id, parallax, parallax_error,
+               phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, ruwe
+        FROM {GAIA_TABLE_NAME}
+        WHERE source_id IN ({id_list_str})
+        """
+        print(f"Querying Gaia for model stars batch {i+1}/{num_batches}...")
+        try:
+            job = Gaia.launch_job(query); results_table = job.get_results()
+            if len(results_table) > 0: all_gaia_data_dfs.append(results_table.to_pandas())
+        except Exception as e: print(f"Error Gaia query batch {i+1}: {e}")
+    if not all_gaia_data_dfs: return pd.DataFrame()
+    df_gaia_queried = pd.concat(all_gaia_data_dfs, ignore_index=True)
+    if 'source_id' in df_gaia_queried.columns:
+        df_gaia_queried['source_id'] = df_gaia_queried['source_id'].astype(np.int64)
+    return df_gaia_queried
+
+def query_gaia_for_background_stars():
+    query = f"""
+    SELECT TOP {BACKGROUND_QUERY_LIMIT}
+           source_id, parallax, parallax_error,
+           phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, ruwe
+    FROM {GAIA_TABLE_NAME}
+    WHERE parallax >= {BACKGROUND_PARALLAX_MIN}
+      AND phot_g_mean_mag <= {BACKGROUND_G_MAG_MAX}
+      AND ruwe < {BACKGROUND_RUWE_MAX}
+      AND phot_bp_mean_mag IS NOT NULL AND phot_rp_mean_mag IS NOT NULL
+      AND phot_g_mean_mag IS NOT NULL AND parallax IS NOT NULL 
+    ORDER BY random_index
+    """
+    print(f"\nQuerying Gaia for {BACKGROUND_QUERY_LIMIT} background stars...")
+    try:
+        job = Gaia.launch_job(query); results_table = job.get_results()
+        if len(results_table) > 0:
+            df_background = results_table.to_pandas()
+            if 'source_id' in df_background.columns:
+                 df_background['source_id'] = df_background['source_id'].astype(np.int64)
+            print(f"Retrieved {len(df_background)} background stars from Gaia.")
+            return df_background
+        else: print("Background query returned no results."); return pd.DataFrame()
+    except Exception as e: print(f"Error background query: {e}"); return pd.DataFrame()
+
+# ... (Keep all the script before step 4) ...
+
+# --- 4. Fetch Data from Gaia ---
+print("\n--- Fetching Gaia data for stars from your model input file ---")
+df_all_model_stars_gaia_raw = query_gaia_for_specific_ids_batched(unique_source_ids_for_model_query)
+
+if not df_all_model_stars_gaia_raw.empty:
+    # These are the RR* IDs your model identified
+    model_rr_ids_set = set(unique_predicted_rr_star_ids_model)
+    
+    # These are the RR* IDs that were actually found in the main Gaia query
+    found_rr_ids_in_main_query_set = set(df_all_model_stars_gaia_raw[
+        df_all_model_stars_gaia_raw['source_id'].isin(model_rr_ids_set)
+    ]['source_id'])
+    
+    print(f"Out of {len(model_rr_ids_set)} model-identified RR*, {len(found_rr_ids_in_main_query_set)} were found in the initial Gaia query results.")
+
+    # Identify the RR* IDs that were NOT found
+    missing_rr_ids_set = model_rr_ids_set - found_rr_ids_in_main_query_set
+    print(f"{len(missing_rr_ids_set)} model-identified RR* IDs were NOT found in the initial Gaia query.")
+
+    if missing_rr_ids_set:
+        print("\n--- DEBUG: Checking a sample of MISSING RR* IDs individually in Gaia DR3 ---")
+        sample_missing_ids = list(missing_rr_ids_set)[:20] # Check the first 20 missing IDs
+        
+        if sample_missing_ids:
+            missing_ids_found_in_debug_check = []
+            query_template_single = "SELECT source_id, phot_g_mean_mag FROM gaiadr3.gaia_source WHERE source_id = {}"
+            
+            for i, missing_id in enumerate(sample_missing_ids):
+                print(f"  Debug Query {i+1}/{len(sample_missing_ids)} for missing ID: {missing_id}")
+                try:
+                    job = Gaia.launch_job(query_template_single.format(missing_id))
+                    results = job.get_results()
+                    if len(results) > 0:
+                        print(f"    SUCCESS: Missing ID {missing_id} WAS FOUND in gaiadr3.gaia_source during debug check.")
+                        missing_ids_found_in_debug_check.append(missing_id)
+                    else:
+                        print(f"    FAILURE: Missing ID {missing_id} was NOT FOUND in gaiadr3.gaia_source during debug check.")
+                except Exception as e:
+                    print(f"    ERROR during debug query for {missing_id}: {e}")
+            
+            print(f"Debug Check Summary: Out of {len(sample_missing_ids)} sampled missing RR* IDs, {len(missing_ids_found_in_debug_check)} were found by individual queries.")
+            if len(missing_ids_found_in_debug_check) == len(sample_missing_ids) and len(sample_missing_ids) > 0:
+                print("    This is unexpected! If individual queries find them, there might be an issue with how the large batch query is handled by Gaia TAP or a very subtle data type/formatting issue for those specific IDs in the batch.")
+            elif len(missing_ids_found_in_debug_check) < len(sample_missing_ids) and len(missing_ids_found_in_debug_check) > 0:
+                 print("    Some were found individually but not in the batch - this is strange and points to potential TAP service inconsistencies for batch vs single ID queries for these specific IDs.")
+            elif not missing_ids_found_in_debug_check:
+                 print("    None of the sampled missing IDs were found individually. This strongly suggests these IDs are not in gaiadr3.gaia_source under these identifiers or have no photometry.")
+
+else:
+    print("Warning: Gaia query for model input stars returned no results. Cannot perform RR* ID check.")
+    # rr_stars_in_gaia_query_results = pd.DataFrame() # Ensure it exists - this line is not strictly needed here with new logic
+
+# ... (Rest of the script: Fetching background, prepare_for_cmd, plotting) ...
+
+# --- 5. Prepare DataFrames for CMD Plotting ---
+def prepare_for_cmd(df_input, df_name_for_log, initial_rr_ids_set=None, is_rr_candidate_df=False, ruwe_cut_val=None):
+    """Calculates color, absolute magnitude, and applies filters. Logs losses for RR* candidates."""
+    if df_input.empty:
+        print(f"Log ({df_name_for_log}): Input DataFrame is empty.")
+        return pd.DataFrame()
+    
+    df = df_input.copy()
+    original_count = len(df)
+    rr_ids_in_df = set()
+    if initial_rr_ids_set and 'source_id' in df.columns:
+        rr_ids_in_df = initial_rr_ids_set.intersection(set(df['source_id']))
+    
+    if is_rr_candidate_df:
+        print(f"\n--- Processing RR* Candidates from '{df_name_for_log}' (Initial count: {original_count}, containing {len(rr_ids_in_df)} of model's RR* IDs) ---")
+
+    required_cols = ['phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag', 'parallax']
+    if not all(col in df.columns for col in required_cols):
+        print(f"Log ({df_name_for_log}): Missing one or more required CMD columns: {required_cols}")
+        return pd.DataFrame()
+
+    # Step 1: Drop rows with NaN in essential photometric/parallax columns
+    df.dropna(subset=required_cols, inplace=True)
+    count_after_dropna = len(df)
+    if is_rr_candidate_df:
+        rr_ids_after_dropna = initial_rr_ids_set.intersection(set(df['source_id']))
+        print(f"  After dropping NaNs in essential mags/parallax: {count_after_dropna} rows remain (RR* IDs: {len(rr_ids_after_dropna)}, lost {len(rr_ids_in_df) - len(rr_ids_after_dropna)})")
+        rr_ids_in_df = rr_ids_after_dropna # Update current set of RR* IDs
+
+    # Step 2: Filter for valid parallax values
+    df = df[df['parallax'] > 0]
+    count_after_pos_parallax = len(df)
+    if is_rr_candidate_df:
+        rr_ids_after_pos_parallax = initial_rr_ids_set.intersection(set(df['source_id']))
+        print(f"  After requiring parallax > 0: {count_after_pos_parallax} rows remain (RR* IDs: {len(rr_ids_after_pos_parallax)}, lost {len(rr_ids_in_df) - len(rr_ids_after_pos_parallax)})")
+        rr_ids_in_df = rr_ids_after_pos_parallax
+
+    # Step 3: Apply RUWE cut (if specified)
+    if ruwe_cut_val is not None and 'ruwe' in df.columns:
+        df = df[df['ruwe'] < ruwe_cut_val]
+        count_after_ruwe = len(df)
+        if is_rr_candidate_df:
+            rr_ids_after_ruwe = initial_rr_ids_set.intersection(set(df['source_id']))
+            print(f"  After RUWE < {ruwe_cut_val}: {count_after_ruwe} rows remain (RR* IDs: {len(rr_ids_after_ruwe)}, lost {len(rr_ids_in_df) - len(rr_ids_after_ruwe)})")
+            rr_ids_in_df = rr_ids_after_ruwe
+    elif is_rr_candidate_df and ruwe_cut_val is not None :
+         print(f"  RUWE column not found, skipping RUWE cut for '{df_name_for_log}'.")
+
+
+    if df.empty:
+        print(f"Log ({df_name_for_log}): DataFrame became empty after filtering.")
+        return pd.DataFrame()
+
+    df['color'] = df['phot_bp_mean_mag'] - df['phot_rp_mean_mag']
+    df['distance_pc'] = 1000.0 / df['parallax']
+    df['abs_mag_g'] = df['phot_g_mean_mag'] - 5 * (np.log10(df['distance_pc']) - 1)
+    
+    # Final check for NaNs in calculated color/abs_mag (should be rare if inputs are fine)
+    df.dropna(subset=['color', 'abs_mag_g'], inplace=True)
+    count_after_cmd_calc = len(df)
+    if is_rr_candidate_df:
+        rr_ids_after_cmd_calc = initial_rr_ids_set.intersection(set(df['source_id']))
+        print(f"  After CMD calculations & final NaN drop: {count_after_cmd_calc} rows remain (RR* IDs: {len(rr_ids_after_cmd_calc)}, lost {len(rr_ids_in_df) - len(rr_ids_after_cmd_calc)})")
+        print(f"  Total RR* IDs surviving for CMD plotting from '{df_name_for_log}': {len(rr_ids_after_cmd_calc)}")
+
+    # Add the 'is_model_rr_star' flag for the model stars DataFrame
+    if is_rr_candidate_df and initial_rr_ids_set and 'source_id' in df.columns:
+        df['is_model_rr_star'] = df['source_id'].isin(initial_rr_ids_set)
+    
+    return df
+
+print("\n--- Preparing CMD data ---")
+# Prepare the DataFrame that contains ALL stars from your model input (including RR* candidates)
+# The 'is_rr_candidate_df=True' will trigger detailed logging for the RR* subset within this df.
+df_cmd_all_model_stars = prepare_for_cmd(
+    df_all_model_stars_gaia_raw,
+    df_name_for_log="All Model Input Stars (includes RR*)",
+    initial_rr_ids_set=set(unique_predicted_rr_star_ids_model), # Pass the original 499 RR* IDs
+    is_rr_candidate_df=True, # This flag is to ensure detailed logging for RR* losses
+    ruwe_cut_val=RR_STAR_RUWE_MAX # Use the specific RUWE cut for RR*
+)
+
+df_cmd_background = prepare_for_cmd(
+    df_background_gaia_raw,
+    df_name_for_log="Background Gaia Sample",
+    ruwe_cut_val=BACKGROUND_RUWE_MAX # Use the general background RUWE cut
+)
+
+# --- 6. Create and Display the CMD Plot ---
+print("\n--- Generating CMD Plot ---")
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.figure(figsize=(12, 10))
+
+# A. Plot the DENSE BACKGROUND stars first
+if not df_cmd_background.empty:
+    plt.scatter(df_cmd_background['color'], df_cmd_background['abs_mag_g'],
+                s=1, color='silver', alpha=0.3,
+                label=f'Nearby Stars (Gaia sample, N={len(df_cmd_background)})', zorder=1)
+    print(f"Plotting {len(df_cmd_background)} background stars.")
+else:
+    print("No background stars to plot.")
+
+# B. Highlight the RR* stars classified by your model (NO "Other Model Input Stars")
+if not df_cmd_all_model_stars.empty and 'is_model_rr_star' in df_cmd_all_model_stars.columns:
+    model_rr_stars_to_plot = df_cmd_all_model_stars[df_cmd_all_model_stars['is_model_rr_star']] # Filter based on the flag
+    if not model_rr_stars_to_plot.empty:
+        plt.scatter(model_rr_stars_to_plot['color'], model_rr_stars_to_plot['abs_mag_g'],
+                    s=70, color='red', edgecolor='black', marker='*',
+                    label=f'Model Classified RR* (N={len(model_rr_stars_to_plot)})', zorder=3)
+        print(f"Plotting {len(model_rr_stars_to_plot)} model-classified RR* stars.")
+    else:
+        print("No model-classified RR* stars with valid CMD data to plot after all filters.")
+else:
+    print("No model input stars (including RR*) with valid CMD data to plot, or 'is_model_rr_star' column missing.")
+
+plt.xlabel('Color ($G_{BP} - G_{RP}$)', fontsize=14)
+plt.ylabel('Absolute G Magnitude ($M_G$)', fontsize=14)
+plt.title('Color-Magnitude Diagram: Model RR Lyrae with Dense Background', fontsize=16)
+plt.gca().invert_yaxis()
+
+all_colors, all_abs_mags = [], []
+if not df_cmd_background.empty:
+    all_colors.extend(df_cmd_background['color'].tolist())
+    all_abs_mags.extend(df_cmd_background['abs_mag_g'].tolist())
+# Include RR* in limits calculation if they exist
+if not df_cmd_all_model_stars.empty and 'is_model_rr_star' in df_cmd_all_model_stars.columns:
+    model_rr_stars_to_plot_for_limits = df_cmd_all_model_stars[df_cmd_all_model_stars['is_model_rr_star']]
+    if not model_rr_stars_to_plot_for_limits.empty:
+        all_colors.extend(model_rr_stars_to_plot_for_limits['color'].tolist())
+        all_abs_mags.extend(model_rr_stars_to_plot_for_limits['abs_mag_g'].tolist())
+
+if all_colors and all_abs_mags:
+    color_min, color_max = np.nanpercentile(all_colors, [1, 99])
+    abs_mag_min, abs_mag_max = np.nanpercentile(all_abs_mags, [1, 99])
+    plt.xlim(color_min - 0.2, color_max + 0.2)
+    plt.ylim(abs_mag_max + 1, abs_mag_min - 1)
+else:
+    plt.xlim(-0.5, 3.0); plt.ylim(18, -6)
+
+plt.legend(fontsize=10, loc='upper right')
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.xticks(fontsize=12); plt.yticks(fontsize=12)
+plt.tight_layout()
+
+if SAVE_FIGURE:
+    plt.savefig(FIGURE_FILENAME, dpi=300)
+    print(f"CMD plot saved as {FIGURE_FILENAME}")
+plt.show()
+print("\nScript finished.")
